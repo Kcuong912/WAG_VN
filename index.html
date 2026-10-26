@@ -1,0 +1,4930 @@
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Crosshair, KeyRound, Swords, Users } from "lucide-react";
+import {
+  DYES,
+  MAPS,
+  MODS,
+  WEAPONS,
+  botKit,
+  botName,
+  dailyMod,
+  mapById,
+  weapon,
+  type MatchConfig,
+  type ModeId,
+  type ModId,
+  type SlotConfig,
+} from "./content";
+import { Hud } from "./hud";
+import {
+  applyMatchResult,
+  claimContract,
+  CONTRACTS,
+  defaultProfile,
+  dyeHex,
+  loadProfile,
+  saveProfile,
+  unlockDye,
+  unlockWeapon,
+  weaponOwned,
+  type Profile,
+} from "./profile";
+import { playUi, setVolume, unlockAudio } from "./audio";
+import { useP2PRoom } from "@/lib/multiplayer/use-p2p-room";
+import type { HudModel, NetHandle } from "./session";
+import { Lobby3D } from "./Lobby3D";
+
+type Flow =
+  | { kind: "home" }
+  | { kind: "armory" }
+  | { kind: "contracts" }
+  | { kind: "setup"; mode: ModeId }
+  | { kind: "match"; cfg: MatchConfig; solo: boolean }
+  | { kind: "room"; code: string; hosting: boolean };
+
+function makeCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let s = "";
+  for (let i = 0; i < 4; i++) s += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return s;
+}
+
+function soloConfig(p: Profile, mode: ModeId, mapId: string, mod: ModId): MatchConfig {
+  const selfId = "local";
+  const slots: SlotConfig[] = [
+    {
+      id: selfId,
+      name: p.name || "Khách",
+      team: 0,
+      bot: false,
+      color: dyeHex(p),
+      weapons: p.loadout,
+    },
+  ];
+  let n = 0;
+  if (mode === "2v2") {
+    slots.push({
+      id: "bot-ally",
+      name: botName(n),
+      team: 0,
+      bot: true,
+      color: "#c4564a",
+      weapons: botKit(n),
+    });
+    n++;
+  }
+  const enemies = mode === "1v1" ? 1 : 2;
+  for (let i = 0; i < enemies; i++) {
+    slots.push({
+      id: `bot-e-${i}`,
+      name: botName(n + i),
+      team: 1,
+      bot: true,
+      color: i === 0 ? "#3c7dff" : "#7eb0ff",
+      weapons: botKit(n + i + 1),
+    });
+  }
+  return { mode, mapId, mod, slots, selfId, nonce: Date.now() };
+}
+
+export function DuelForge() {
+  const [profile, setProfile] = useState<Profile>(defaultProfile);
+  const [booted, setBooted] = useState(false);
+  const [flow, setFlow] = useState<Flow>({ kind: "home" });
+  const [gain, setGain] = useState<number | null>(null);
+
+  useEffect(() => {
+    const p = loadProfile();
+    setProfile(p);
+    setVolume(p.volume);
+    setBooted(true);
+    const room = new URLSearchParams(window.location.search).get("room");
+    if (room && /^[A-Za-z0-9]{4}$/.test(room)) {
+      setFlow({ kind: "room", code: room.toUpperCase(), hosting: false });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (booted) saveProfile(profile);
+  }, [profile, booted]);
+
+  const quick = (mode: ModeId, mod: ModId = "classic") => {
+    unlockAudio();
+    playUi();
+    const mapId = MAPS[Math.floor(Math.random() * MAPS.length)].id;
+    setGain(null);
+    setFlow({ kind: "match", solo: true, cfg: soloConfig(profile, mode, mapId, mod) });
+  };
+
+  return (
+    <div className="h-full min-h-full bg-bg text-fg">
+      {flow.kind === "home" && (
+        <Lobby3D
+          ready={booted}
+          profile={profile}
+          setProfile={setProfile}
+          onSolo={() => quick("1v1")}
+          onDuo={() => quick("2v2")}
+          onDaily={() => quick("1v1", dailyMod())}
+          onSetup={(mode) => setFlow({ kind: "setup", mode })}
+          onRoom={() => setFlow({ kind: "room", code: makeCode(), hosting: true })}
+          onJoin={(code) => setFlow({ kind: "room", code, hosting: false })}
+          onArmory={() => setFlow({ kind: "armory" })}
+          onContracts={() => setFlow({ kind: "contracts" })}
+        />
+      )}
+      {flow.kind === "armory" && (
+        <Armory profile={profile} setProfile={setProfile} onBack={() => setFlow({ kind: "home" })} />
+      )}
+      {flow.kind === "contracts" && (
+        <Contracts profile={profile} setProfile={setProfile} onBack={() => setFlow({ kind: "home" })} />
+      )}
+      {flow.kind === "setup" && (
+        <Setup
+          mode={flow.mode}
+          onBack={() => setFlow({ kind: "home" })}
+          onStart={(mapId, mod, mode) => {
+            setGain(null);
+            setFlow({ kind: "match", solo: true, cfg: soloConfig(profile, mode, mapId, mod) });
+          }}
+        />
+      )}
+      {flow.kind === "match" && (
+        <MatchCanvas
+          key={flow.cfg.nonce}
+          cfg={flow.cfg}
+          solo={flow.solo}
+          isHost
+          hostId={flow.cfg.selfId}
+          net={null}
+          sens={profile.sens}
+          gain={gain}
+          onDone={(r) => {
+            setProfile((p) => {
+              const out = applyMatchResult(p, r);
+              setGain(out.gained);
+              return out.profile;
+            });
+          }}
+          onRematch={() => {
+            setGain(null);
+            setFlow({
+              kind: "match",
+              solo: true,
+              cfg: soloConfig(profile, flow.cfg.mode, flow.cfg.mapId, flow.cfg.mod),
+            });
+          }}
+          onExit={() => setFlow({ kind: "home" })}
+        />
+      )}
+      {flow.kind === "room" && (
+        <Room
+          code={flow.code}
+          hosting={flow.hosting}
+          profile={profile}
+          gain={gain}
+          onGain={(n) => setGain(n)}
+          onProfile={setProfile}
+          onExit={() => setFlow({ kind: "home" })}
+        />
+      )}
+    </div>
+  );
+}
+
+function Shell({ children }: { children: ReactNode }) {
+  return (
+    <div className="mx-auto flex h-full min-h-full w-full max-w-5xl flex-col gap-5 overflow-y-auto px-4 py-5">
+      {children}
+    </div>
+  );
+}
+
+function Home(props: {
+  ready: boolean;
+  profile: Profile;
+  setProfile: (p: Profile | ((p: Profile) => Profile)) => void;
+  onSolo: () => void;
+  onDuo: () => void;
+  onDaily: () => void;
+  onSetup: (mode: ModeId) => void;
+  onRoom: () => void;
+  onJoin: (code: string) => void;
+  onArmory: () => void;
+  onContracts: () => void;
+}) {
+  const { profile } = props;
+  const [code, setCode] = useState("");
+  const daily = MODS.find((m) => m.id === dailyMod()) ?? MODS[1];
+  const primary = weapon(profile.loadout[0]);
+  const secondary = weapon(profile.loadout[1]);
+  return (
+    <Shell>
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="font-display text-4xl leading-none tracking-wide">DUELFORGE</h1>
+          <p className="mt-1 text-sm text-muted">Đấu sàn block, ai tới 5 hiệp trước thì thắng.</p>
+        </div>
+        <div className="flex items-center gap-2 rounded-full border border-line bg-surface px-3 py-2">
+          <KeyRound className="size-4 text-gold" aria-hidden />
+          <span className="font-display text-xl text-gold">{profile.keys}</span>
+          <span className="text-sm text-muted">chuỗi {profile.streak}</span>
+        </div>
+      </header>
+
+      <div className="relative hidden h-44 overflow-hidden rounded-xl border border-line bg-surface md:block">
+        <div className="absolute inset-x-8 bottom-0 h-px bg-line" />
+        <div className="absolute bottom-4 left-[16%]">
+          <BlockGuy tone="bg-team-red" />
+        </div>
+        <div className="absolute bottom-4 right-[16%] -scale-x-100">
+          <BlockGuy tone="bg-team-blue" />
+        </div>
+        <div className="absolute bottom-8 left-1/2 h-2 w-14 -translate-x-1/2 rounded-full bg-gold" />
+        <p className="absolute top-4 left-4 text-sm text-muted">Sảnh đấu · đỏ gặp xanh</p>
+      </div>
+
+      {props.ready ? (
+        <label className="flex max-w-xs flex-col gap-1 text-sm text-muted">
+          Tên trong trận
+          <input
+            value={profile.name}
+            maxLength={14}
+            onChange={(e) => props.setProfile({ ...profile, name: e.target.value.slice(0, 14) })}
+            className="rounded-lg border border-line bg-surface px-3 py-2 text-fg outline-none"
+          />
+        </label>
+      ) : (
+        <p className="text-sm text-muted">Tên trong trận: {profile.name}</p>
+      )}
+
+      <div className="grid gap-3 md:grid-cols-3">
+        <ModeCard title="1v1" text="Một đấu một với bot. Tới 5 hiệp." onClick={props.onSolo} icon={<Swords className="size-5 text-gold" />} />
+        <ModeCard title="2v2" text="Bạn và một bot, đấu hai bot." onClick={props.onDuo} icon={<Users className="size-5 text-gold" />} />
+        <ModeCard title="Phòng bạn" text="Tạo mã, bạn bè vào cùng trận online." onClick={props.onRoom} icon={<Crosshair className="size-5 text-gold" />} />
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <button type="button" className="rounded-lg border border-line bg-surface px-3 py-2 text-sm" onClick={() => props.onSetup("1v1")}>
+          Chọn map 1v1
+        </button>
+        <button type="button" className="rounded-lg border border-line bg-surface px-3 py-2 text-sm" onClick={() => props.onSetup("2v2")}>
+          Chọn map 2v2
+        </button>
+        <button type="button" className="rounded-lg bg-gold px-3 py-2 text-sm text-gold-ink" onClick={props.onDaily}>
+          Luật hôm nay: {daily.name}
+        </button>
+      </div>
+
+      <div className="grid gap-3 md:grid-cols-[1.4fr_1fr]">
+        <section className="rounded-xl border border-line bg-surface p-4">
+          <h2 className="font-display text-xl">Loadout</h2>
+          <p className="mt-1 text-sm text-muted">
+            {primary.name} + {secondary.name} · màu {DYES.find((d) => d.id === profile.dye)?.name}
+          </p>
+          <div className="mt-3 flex gap-2">
+            <button type="button" className="rounded-lg bg-surface-2 px-3 py-2 text-sm" onClick={props.onArmory}>
+              Kho vũ khí
+            </button>
+            <button type="button" className="rounded-lg bg-surface-2 px-3 py-2 text-sm" onClick={props.onContracts}>
+              Hợp đồng
+            </button>
+          </div>
+        </section>
+        <section className="rounded-xl border border-line bg-surface p-4">
+          <h2 className="font-display text-xl">Vào mã phòng</h2>
+          <div className="mt-2 flex gap-2">
+            {props.ready ? (
+              <input
+                value={code}
+                maxLength={4}
+                placeholder="MÃ"
+                onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4))}
+                className="w-28 rounded-lg border border-line bg-bg px-3 py-2 font-display tracking-widest text-fg outline-none"
+              />
+            ) : (
+              <span className="w-28 rounded-lg border border-line bg-bg px-3 py-2 font-display tracking-widest text-muted">
+                MÃ
+              </span>
+            )}
+            <button
+              type="button"
+              disabled={code.length < 4}
+              className="rounded-lg bg-gold px-3 py-2 text-gold-ink disabled:opacity-40"
+              onClick={() => props.onJoin(code)}
+            >
+              Vào
+            </button>
+          </div>
+          <p className="mt-2 text-xs text-muted">Phòng riêng cho bạn bè. Không phải xếp hạng công khai.</p>
+        </section>
+      </div>
+
+      {props.ready && (
+        <div className="grid gap-4 pb-6 md:grid-cols-2">
+          <label className="text-sm text-muted">
+            Độ nhạy chuột {profile.sens.toFixed(2)}
+            <input
+              type="range"
+              min={0.4}
+              max={2}
+              step={0.05}
+              value={profile.sens}
+              onChange={(e) => props.setProfile({ ...profile, sens: Number(e.target.value) })}
+              className="mt-1 w-full accent-gold"
+            />
+          </label>
+          <label className="text-sm text-muted">
+            Âm lượng {Math.round(profile.volume * 100)}%
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={profile.volume}
+              onChange={(e) => {
+                const volume = Number(e.target.value);
+                setVolume(volume);
+                props.setProfile({ ...profile, volume });
+              }}
+              className="mt-1 w-full accent-gold"
+            />
+          </label>
+        </div>
+      )}
+    </Shell>
+  );
+}
+
+function ModeCard({
+  title,
+  text,
+  onClick,
+  icon,
+}: {
+  title: string;
+  text: string;
+  onClick: () => void;
+  icon: ReactNode;
+}) {
+  return (
+    <button type="button" onClick={onClick} className="rounded-xl border border-line bg-surface p-4 text-left">
+      <div className="mb-3">{icon}</div>
+      <div className="font-display text-2xl">{title}</div>
+      <p className="mt-1 text-sm text-muted">{text}</p>
+    </button>
+  );
+}
+
+function BlockGuy({ tone }: { tone: string }) {
+  return (
+    <div className="flex flex-col items-center">
+      <div className={`relative h-8 w-8 rounded-sm ${tone}`}>
+        <div className="absolute top-3 left-1 h-1.5 w-6 rounded-sm bg-fg" />
+      </div>
+      <div className={`mt-0.5 h-9 w-8 rounded-sm ${tone}`} />
+      <div className="mt-0.5 flex gap-1">
+        <div className={`h-7 w-3 rounded-sm ${tone}`} />
+        <div className={`h-7 w-3 rounded-sm ${tone}`} />
+      </div>
+    </div>
+  );
+}
+
+function Armory({
+  profile,
+  setProfile,
+  onBack,
+}: {
+  profile: Profile;
+  setProfile: (p: Profile | ((p: Profile) => Profile)) => void;
+  onBack: () => void;
+}) {
+  return (
+    <Shell>
+      <TopBar title="Kho vũ khí" keys={profile.keys} onBack={onBack} />
+      <p className="text-sm text-muted">Chính: {weapon(profile.loadout[0]).name} · Phụ: {weapon(profile.loadout[1]).name}</p>
+      <div className="grid gap-3 sm:grid-cols-2">
+        {WEAPONS.map((w) => {
+          const owned = weaponOwned(profile, w.id);
+          return (
+            <article key={w.id} className="rounded-xl border border-line bg-surface p-4">
+              <div className="flex items-baseline justify-between gap-2">
+                <h3 className="font-display text-xl">{w.name}</h3>
+                <span className="text-sm text-gold">{w.cost === 0 ? "Sẵn" : `${w.cost} khóa`}</span>
+              </div>
+              <p className="mt-1 text-sm text-muted">{w.blurb}</p>
+              <p className="mt-1 text-xs text-muted">
+                {w.dmg} sát thương · {w.kind === "melee" ? "cận chiến" : `${w.mag} viên`}
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {!owned && (
+                  <button
+                    type="button"
+                    disabled={profile.keys < w.cost}
+                    className="rounded-lg bg-gold px-3 py-2 text-sm text-gold-ink disabled:opacity-40"
+                    onClick={() => {
+                      const next = unlockWeapon(profile, w);
+                      if (next) setProfile(next);
+                    }}
+                  >
+                    Mở khóa
+                  </button>
+                )}
+                {owned && (
+                  <>
+                    <button type="button" className="rounded-lg bg-surface-2 px-3 py-2 text-sm" onClick={() => equip(setProfile, 0, w.id)}>
+                      Gắn chính
+                    </button>
+                    <button type="button" className="rounded-lg bg-surface-2 px-3 py-2 text-sm" onClick={() => equip(setProfile, 1, w.id)}>
+                      Gắn phụ
+                    </button>
+                  </>
+                )}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+      <h2 className="font-display text-xl">Màu người</h2>
+      <div className="flex flex-wrap gap-2 pb-8">
+        {DYES.map((d) => {
+          const owned = profile.dyes.includes(d.id);
+          const on = profile.dye === d.id;
+          return (
+            <button
+              key={d.id}
+              type="button"
+              onClick={() => {
+                const next = unlockDye(profile, d.id);
+                if (next) setProfile(next);
+              }}
+              className={`flex items-center gap-2 rounded-full border px-3 py-2 text-sm ${on ? "border-gold" : "border-line"} bg-surface`}
+            >
+              <span className="inline-block h-4 w-4 rounded-sm" style={{ background: d.hex }} />
+              {d.name}
+              {!owned && d.cost > 0 ? ` · ${d.cost}` : ""}
+            </button>
+          );
+        })}
+      </div>
+    </Shell>
+  );
+}
+
+function equip(setProfile: (p: Profile | ((p: Profile) => Profile)) => void, slot: 0 | 1, id: string) {
+  setProfile((p) => {
+    if (!weaponOwned(p, id)) return p;
+    const loadout: [string, string] = [p.loadout[0], p.loadout[1]];
+    loadout[slot] = id;
+    if (loadout[0] === loadout[1]) return p;
+    return { ...p, loadout };
+  });
+}
+
+function Contracts({
+  profile,
+  setProfile,
+  onBack,
+}: {
+  profile: Profile;
+  setProfile: (p: Profile) => void;
+  onBack: () => void;
+}) {
+  return (
+    <Shell>
+      <TopBar title="Hợp đồng ngày" keys={profile.keys} onBack={onBack} />
+      <div className="grid gap-3 pb-8">
+        {CONTRACTS.map((c) => {
+          const prog = profile.prog[c.id];
+          const pct = Math.min(100, (prog / c.goal) * 100);
+          const ready = prog >= c.goal && !profile.claimed[c.id];
+          return (
+            <article key={c.id} className="rounded-xl border border-line bg-surface p-4">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="font-display text-xl">{c.name}</h3>
+                <span className="text-gold">{c.reward} khóa</span>
+              </div>
+              <div className="mt-3 h-2 overflow-hidden rounded-full bg-surface-2">
+                <div className="h-full bg-gold" style={{ width: `${pct}%` }} />
+              </div>
+              <div className="mt-2 flex items-center justify-between text-sm text-muted">
+                <span>
+                  {Math.min(prog, c.goal)}/{c.goal}
+                </span>
+                {profile.claimed[c.id] ? (
+                  <span>Đã nhận</span>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={!ready}
+                    className="rounded-lg bg-gold px-3 py-2 text-gold-ink disabled:opacity-40"
+                    onClick={() => setProfile(claimContract(profile, c.id))}
+                  >
+                    Nhận
+                  </button>
+                )}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </Shell>
+  );
+}
+
+function Setup({
+  mode,
+  onBack,
+  onStart,
+}: {
+  mode: ModeId;
+  onBack: () => void;
+  onStart: (mapId: string, mod: ModId, mode: ModeId) => void;
+}) {
+  const [mapId, setMapId] = useState(MAPS[0].id);
+  const [mod, setMod] = useState<ModId>("classic");
+  const [m, setM] = useState<ModeId>(mode);
+  return (
+    <Shell>
+      <TopBar title="Tùy trận" keys={0} onBack={onBack} hideKeys />
+      <div className="flex gap-2">
+        {(["1v1", "2v2"] as const).map((id) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setM(id)}
+            className={`rounded-lg px-3 py-2 ${m === id ? "bg-gold text-gold-ink" : "bg-surface text-fg"}`}
+          >
+            {id}
+          </button>
+        ))}
+      </div>
+      <div className="grid gap-2 sm:grid-cols-3">
+        {MAPS.map((map) => (
+          <button
+            key={map.id}
+            type="button"
+            onClick={() => setMapId(map.id)}
+            className={`rounded-xl border p-3 text-left ${mapId === map.id ? "border-gold bg-surface" : "border-line bg-surface"}`}
+          >
+            <div className="font-display text-lg">{map.name}</div>
+            <p className="text-sm text-muted">{map.blurb}</p>
+          </button>
+        ))}
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {MODS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => setMod(item.id)}
+            className={`rounded-xl border p-3 text-left ${mod === item.id ? "border-gold bg-surface" : "border-line bg-surface"}`}
+          >
+            <div className="font-display text-lg">{item.name}</div>
+            <p className="text-sm text-muted">{item.blurb}</p>
+          </button>
+        ))}
+      </div>
+      <button
+        type="button"
+        className="mb-8 w-fit rounded-lg bg-gold px-4 py-3 text-gold-ink"
+        onClick={() => {
+          unlockAudio();
+          onStart(mapId, mod, m);
+        }}
+      >
+        Bắt đầu
+      </button>
+    </Shell>
+  );
+}
+
+function TopBar({
+  title,
+  keys,
+  onBack,
+  hideKeys,
+}: {
+  title: string;
+  keys: number;
+  onBack: () => void;
+  hideKeys?: boolean;
+}) {
+  return (
+    <header className="flex items-center justify-between gap-3">
+      <button type="button" onClick={onBack} className="rounded-lg border border-line px-3 py-2 text-sm">
+        Về sảnh
+      </button>
+      <h1 className="font-display text-2xl">{title}</h1>
+      {hideKeys ? <span /> : <span className="font-display text-gold">{keys} khóa</span>}
+    </header>
+  );
+}
+
+function Room({
+  code,
+  hosting,
+  profile,
+  gain,
+  onGain,
+  onProfile,
+  onExit,
+}: {
+  code: string;
+  hosting: boolean;
+  profile: Profile;
+  gain: number | null;
+  onGain: (n: number | null) => void;
+  onProfile: (p: Profile | ((p: Profile) => Profile)) => void;
+  onExit: () => void;
+}) {
+  const p2p = useP2PRoom({ room: `df-${code}`, name: profile.name || "Khách" });
+  const [mode, setMode] = useState<ModeId>("1v1");
+  const [mapId, setMapId] = useState(MAPS[0].id);
+  const [mod, setMod] = useState<ModId>("classic");
+  const [team, setTeam] = useState<0 | 1>(hosting ? 0 : 1);
+  const [people, setPeople] = useState<
+    { id: string; name: string; color: string; weapons: [string, string]; team: 0 | 1 }[]
+  >([]);
+  const [cfg, setCfg] = useState<MatchConfig | null>(null);
+  const peopleRef = useRef(people);
+  peopleRef.current = people;
+  const peersRef = useRef(p2p.peers);
+  peersRef.current = p2p.peers;
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;
+  const lobbyRef = useRef({ mode, mapId, mod, team });
+  lobbyRef.current = { mode, mapId, mod, team };
+
+  useEffect(() => {
+    return p2p.onMessage((_from, data) => {
+      if (!data || typeof data !== "object") return;
+      const msg = data as {
+        k?: string;
+        id?: string;
+        name?: string;
+        color?: string;
+        weapons?: [string, string];
+        team?: 0 | 1;
+        mode?: ModeId;
+        mapId?: string;
+        mod?: ModId;
+        cfg?: MatchConfig;
+      };
+      if (msg.k === "meta" && msg.id && msg.weapons && (msg.team === 0 || msg.team === 1)) {
+        setPeople((prev) => {
+          const rest = prev.filter((p) => p.id !== msg.id);
+          rest.push({
+            id: msg.id as string,
+            name: msg.name || "Khách",
+            color: msg.color || "#e23b3b",
+            weapons: msg.weapons as [string, string],
+            team: msg.team as 0 | 1,
+          });
+          return rest;
+        });
+      }
+      if (msg.k === "lobby" && !hosting && msg.mode && msg.mapId && msg.mod) {
+        setMode(msg.mode);
+        setMapId(msg.mapId);
+        setMod(msg.mod);
+      }
+      if (msg.k === "start" && msg.cfg) {
+        if (msg.cfg.slots.some((s) => s.id === p2p.selfId)) setCfg(msg.cfg);
+      }
+    });
+  }, [p2p, hosting]);
+
+  useEffect(() => {
+    const send = () => {
+      p2p.broadcast({
+        k: "meta",
+        id: p2p.selfId,
+        name: profile.name || "Khách",
+        color: dyeHex(profile),
+        weapons: profile.loadout,
+        team: lobbyRef.current.team,
+      });
+      if (hosting) {
+        p2p.broadcast({
+          k: "lobby",
+          mode: lobbyRef.current.mode,
+          mapId: lobbyRef.current.mapId,
+          mod: lobbyRef.current.mod,
+          hostId: p2p.selfId,
+        });
+      }
+    };
+    send();
+    const id = window.setInterval(send, 500);
+    return () => window.clearInterval(id);
+  }, [p2p, profile.name, profile.loadout, profile.dye, hosting]);
+
+  useEffect(() => {
+    if (!hosting || !cfg) return;
+    const id = window.setInterval(() => {
+      const live = cfgRef.current;
+      if (live) p2p.broadcast({ k: "start", cfg: live, hostId: p2p.selfId });
+    }, 800);
+    return () => window.clearInterval(id);
+  }, [hosting, cfg, p2p]);
+
+  const start = () => {
+    unlockAudio();
+    const me = {
+      id: p2p.selfId,
+      name: profile.name || "Khách",
+      color: dyeHex(profile),
+      weapons: profile.loadout,
+      team,
+    };
+    const others = peersRef.current.map((peer) => {
+      const meta = peopleRef.current.find((p) => p.id === peer.id);
+      return {
+        id: peer.id,
+        name: meta?.name || peer.name || "Khách",
+        color: meta?.color || "#3c7dff",
+        weapons: meta?.weapons ?? (["rifle", "sidearm"] as [string, string]),
+        team: meta?.team ?? 1,
+      };
+    });
+    const humans = [me, ...others];
+    const cap = mode === "1v1" ? 1 : 2;
+    const count: [number, number] = [0, 0];
+    const slots: SlotConfig[] = [];
+    for (const h of humans) {
+      let side: 0 | 1 = h.team;
+      if (count[side] >= cap) side = side === 0 ? 1 : 0;
+      if (count[side] >= cap) continue;
+      count[side]++;
+      slots.push({
+        id: h.id,
+        name: h.name,
+        team: side,
+        bot: false,
+        color: h.color,
+        weapons: h.weapons,
+      });
+    }
+    let bi = 0;
+    for (const side of [0, 1] as const) {
+      while (count[side] < cap) {
+        slots.push({
+          id: `bot-${side}-${bi}`,
+          name: botName(bi),
+          team: side,
+          bot: true,
+          color: side === 0 ? "#e23b3b" : "#3c7dff",
+          weapons: botKit(bi),
+        });
+        count[side]++;
+        bi++;
+      }
+    }
+    const next: MatchConfig = { mode, mapId, mod, slots, selfId: p2p.selfId, nonce: Date.now() };
+    p2p.send({ k: "start", cfg: next });
+    p2p.broadcast({ k: "start", cfg: next });
+    onGain(null);
+    setCfg(next);
+  };
+
+  if (cfg && cfg.slots.some((s) => s.id === p2p.selfId)) {
+    const net: NetHandle = {
+      broadcast: p2p.broadcast,
+      send: p2p.send,
+      onMessage: p2p.onMessage,
+      selfId: p2p.selfId,
+    };
+    return (
+      <MatchCanvas
+        key={cfg.nonce}
+        cfg={cfg}
+        solo={false}
+        isHost={hosting}
+        hostId={hosting ? p2p.selfId : cfg.slots.find((s) => !s.bot && s.id !== p2p.selfId)?.id || p2p.selfId}
+        net={net}
+        sens={profile.sens}
+        gain={gain}
+        onDone={(r) => {
+          onProfile((p) => {
+            const out = applyMatchResult(p, r);
+            onGain(out.gained);
+            return out.profile;
+          });
+        }}
+        onRematch={
+          hosting
+            ? () => {
+                onGain(null);
+                start();
+              }
+            : undefined
+        }
+        onExit={() => {
+          setCfg(null);
+          if (!hosting) onExit();
+        }}
+      />
+    );
+  }
+
+  const roster = [
+    { id: p2p.selfId, name: profile.name || "Khách", team, pending: false },
+    ...p2p.peers.map((peer) => ({
+      id: peer.id,
+      name: peer.name || people.find((p) => p.id === peer.id)?.name || "Khách",
+      team: people.find((p) => p.id === peer.id)?.team ?? 1,
+      pending: peer.connectionState !== "connected",
+      state: peer.connectionState,
+    })),
+  ];
+
+  return (
+    <Shell>
+      <TopBar title="Phòng bạn" keys={profile.keys} onBack={onExit} />
+      <div className="rounded-xl border border-line bg-surface p-4">
+        <div className="font-display text-sm tracking-widest text-muted">MÃ PHÒNG</div>
+        <div className="mt-1 flex flex-wrap items-center gap-3">
+          <span className="font-display text-5xl tracking-widest text-gold">{code}</span>
+          <button
+            type="button"
+            className="rounded-lg border border-line px-3 py-2 text-sm"
+            onClick={() => {
+              const link = `${window.location.origin}${window.location.pathname}?room=${code}`;
+              void navigator.clipboard?.writeText(link);
+            }}
+          >
+            Chép liên kết
+          </button>
+        </div>
+        <p className="mt-2 text-sm text-muted">
+          {p2p.joined ? "Đã vào sảnh tín hiệu." : "Đang mở phòng…"} Bạn cùng màu là đồng đội. Khác màu là đối thủ. Ô trống được bot lấp.
+        </p>
+      </div>
+
+      {hosting ? (
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="flex gap-2">
+            {(["1v1", "2v2"] as const).map((id) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setMode(id)}
+                className={`rounded-lg px-3 py-2 ${mode === id ? "bg-gold text-gold-ink" : "bg-surface"}`}
+              >
+                {id}
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {MAPS.map((map) => (
+              <button
+                key={map.id}
+                type="button"
+                onClick={() => setMapId(map.id)}
+                className={`rounded-lg px-3 py-2 text-sm ${mapId === map.id ? "bg-gold text-gold-ink" : "bg-surface"}`}
+              >
+                {map.name}
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-2 md:col-span-2">
+            {MODS.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setMod(item.id)}
+                className={`rounded-lg px-3 py-2 text-sm ${mod === item.id ? "bg-gold text-gold-ink" : "bg-surface"}`}
+              >
+                {item.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm text-muted">
+          Chủ phòng chọn {mode} · {mapById(mapId).name} · {MODS.find((m) => m.id === mod)?.name}
+        </p>
+      )}
+
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={() => setTeam(0)}
+          className={`rounded-lg px-3 py-2 ${team === 0 ? "bg-team-red text-fg" : "bg-surface"}`}
+        >
+          Đội đỏ
+        </button>
+        <button
+          type="button"
+          onClick={() => setTeam(1)}
+          className={`rounded-lg px-3 py-2 ${team === 1 ? "bg-team-blue text-fg" : "bg-surface"}`}
+        >
+          Đội xanh
+        </button>
+      </div>
+
+      <ul className="flex flex-col gap-2">
+        {roster.map((r) => (
+          <li key={r.id} className="flex items-center justify-between rounded-lg border border-line bg-surface px-3 py-2">
+            <span>{r.name}{r.id === p2p.selfId ? " (bạn)" : ""}</span>
+            <span className={r.team === 0 ? "text-team-red" : "text-team-blue"}>
+              {r.team === 0 ? "Đỏ" : "Xanh"}
+              {"pending" in r && r.pending ? " · đang nối" : ""}
+              {"state" in r && r.state === "failed" ? " · không nối được" : ""}
+            </span>
+          </li>
+        ))}
+      </ul>
+
+      {hosting && (
+        <button type="button" onClick={start} className="mb-8 w-fit rounded-lg bg-gold px-4 py-3 text-gold-ink">
+          Bắt đầu trận
+        </button>
+      )}
+      {!hosting && <p className="pb-8 text-sm text-muted">Đợi chủ phòng bấm bắt đầu.</p>}
+    </Shell>
+  );
+}
+
+function MatchCanvas(props: {
+  cfg: MatchConfig;
+  solo: boolean;
+  isHost: boolean;
+  hostId: string;
+  net: NetHandle | null;
+  sens: number;
+  gain: number | null;
+  onDone: (r: { won: boolean; kills: number; rounds: number }) => void;
+  onRematch?: () => void;
+  onExit: () => void;
+}) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const [hud, setHud] = useState<HudModel | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [leave, setLeave] = useState(false);
+  const [coarse, setCoarse] = useState(false);
+  const pausedRef = useRef(false);
+  pausedRef.current = paused;
+  const done = useRef(false);
+  const onDoneRef = useRef(props.onDone);
+  onDoneRef.current = props.onDone;
+
+  useEffect(() => {
+    const q = window.matchMedia("(pointer: coarse)");
+    const update = () => setCoarse(q.matches || window.innerWidth < 800);
+    update();
+    q.addEventListener("change", update);
+    window.addEventListener("resize", update);
+    return () => {
+      q.removeEventListener("change", update);
+      window.removeEventListener("resize", update);
+    };
+  }, []);
+
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    let stop = () => {};
+    let dead = false;
+    const solo = props.solo;
+    void import("./session").then((mod) => {
+      if (dead) return;
+      stop = mod.startSession({
+        canvas,
+        cfg: props.cfg,
+        isHost: props.isHost,
+        hostId: props.hostId,
+        net: props.net,
+        sens: props.sens,
+        getPaused: () => pausedRef.current,
+        onHud: (h) => setHud(h),
+        onEscape: () => {
+          if (solo) setPaused((p) => !p);
+          else setLeave(true);
+        },
+      });
+    });
+    return () => {
+      dead = true;
+      stop();
+    };
+    // remount is controlled by the parent key
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!hud?.ended || done.current) return;
+    done.current = true;
+    onDoneRef.current({
+      won: hud.winner === hud.myTeam,
+      kills: hud.kills,
+      rounds: hud.scores[0] + hud.scores[1],
+    });
+  }, [hud]);
+
+  return (
+    <div className="fixed inset-0 z-30 bg-bg" style={{ touchAction: "none" }}>
+      <canvas ref={ref} className="block h-full w-full" />
+      {hud && <Hud hud={hud} coarse={coarse} />}
+      {(paused || leave) && !hud?.ended && (
+        <div data-ui className="absolute inset-0 z-40 flex items-center justify-center bg-bg/75 px-4">
+          <div className="w-full max-w-sm rounded-xl border border-line bg-surface p-5 text-center">
+            <h2 className="font-display text-3xl">{paused ? "Tạm dừng" : "Rời trận?"}</h2>
+            <div className="mt-4 flex justify-center gap-2">
+              <button
+                type="button"
+                data-ui
+                className="rounded-lg bg-gold px-4 py-3 text-gold-ink"
+                onClick={() => {
+                  setPaused(false);
+                  setLeave(false);
+                  ref.current?.requestPointerLock?.();
+                }}
+              >
+                Tiếp tục
+              </button>
+              <button type="button" data-ui className="rounded-lg border border-line px-4 py-3" onClick={props.onExit}>
+                Về sảnh
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {hud?.ended && (
+        <div data-ui className="absolute inset-0 z-40 flex items-center justify-center bg-bg/75 px-4">
+          <div className="w-full max-w-sm rounded-xl border border-line bg-surface p-6 text-center">
+            <h2 className="font-display text-4xl">{hud.winner === hud.myTeam ? "Thắng trận" : "Thua trận"}</h2>
+            <p className="mt-2 text-muted">
+              {hud.scores[0]} — {hud.scores[1]} · {hud.kills} mạng
+            </p>
+            {props.gain != null && <p className="mt-2 font-display text-xl text-gold">+{props.gain} chìa khóa</p>}
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              {props.onRematch && (
+                <button type="button" data-ui className="rounded-lg bg-gold px-4 py-3 text-gold-ink" onClick={props.onRematch}>
+                  Chơi lại
+                </button>
+              )}
+              <button type="button" data-ui className="rounded-lg border border-line px-4 py-3" onClick={props.onExit}>
+                Về sảnh
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+import { useEffect, useRef, useState } from "react";
+import * as THREE from "three";
+import { KeyRound, Package, ScrollText, DoorOpen, Trophy } from "lucide-react";
+import type { Profile } from "./profile";
+import type { ModeId } from "./content";
+import { playUi, unlockAudio } from "./audio";
+
+type Props = {
+  ready: boolean;
+  profile: Profile;
+  setProfile: (p: Profile | ((p: Profile) => Profile)) => void;
+  onSolo: () => void;
+  onDuo: () => void;
+  onDaily: () => void;
+  onSetup: (mode: ModeId) => void;
+  onRoom: () => void;
+  onJoin: (code: string) => void;
+  onArmory: () => void;
+  onContracts: () => void;
+};
+
+type Interactable = {
+  kind: "pad" | "npc" | "board";
+  mesh: THREE.Object3D;
+  label: string;
+  mode?: ModeId | "daily";
+  pos: THREE.Vector3;
+  color?: number;
+};
+
+const MOCK_LEADERBOARD = [
+  { rank: 1, name: "NoScopeKing", streak: 48, wins: 312 },
+  { rank: 2, name: "PixelSlayer", streak: 35, wins: 287 },
+  { rank: 3, name: "VNG_Ace", streak: 29, wins: 241 },
+  { rank: 4, name: "ForgeMaster", streak: 22, wins: 198 },
+  { rank: 5, name: "BlueBeam", streak: 18, wins: 176 },
+  { rank: 6, name: "RedRush", streak: 15, wins: 154 },
+  { rank: 7, name: "KeyHunter", streak: 12, wins: 132 },
+  { rank: 8, name: "DailyGrind", streak: 9, wins: 119 },
+];
+
+function createNpc(
+  scene: THREE.Scene,
+  x: number,
+  z: number,
+  bodyColor: number,
+  name: string
+): THREE.Group {
+  const group = new THREE.Group();
+  group.position.set(x, 0, z);
+
+  // Body
+  const body = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.35, 0.7, 4, 8),
+    new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.6 })
+  );
+  body.position.y = 0.9;
+  body.castShadow = true;
+  group.add(body);
+
+  // Head
+  const head = new THREE.Mesh(
+    new THREE.SphereGeometry(0.28, 12, 12),
+    new THREE.MeshStandardMaterial({ color: 0xf0d9b5, roughness: 0.5 })
+  );
+  head.position.y = 1.65;
+  head.castShadow = true;
+  group.add(head);
+
+  // Simple name plate (canvas texture)
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "rgba(18,21,28,0.85)";
+  ctx.roundRect(0, 0, 256, 64, 8);
+  ctx.fill();
+  ctx.fillStyle = "#f0b429";
+  ctx.font = "bold 28px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(name, 128, 42);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  const plate = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.4, 0.35),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide })
+  );
+  plate.position.y = 2.15;
+  group.add(plate);
+
+  scene.add(group);
+  return group;
+}
+
+function createLeaderboardTexture(playerName: string, playerStreak: number): THREE.CanvasTexture {
+  const canvas = document.createElement("canvas");
+  canvas.width = 512;
+  canvas.height = 640;
+  const ctx = canvas.getContext("2d")!;
+
+  // Background
+  ctx.fillStyle = "#1b202b";
+  ctx.fillRect(0, 0, 512, 640);
+
+  // Border
+  ctx.strokeStyle = "#f0b429";
+  ctx.lineWidth = 6;
+  ctx.strokeRect(8, 8, 496, 624);
+
+  // Title
+  ctx.fillStyle = "#f0b429";
+  ctx.font = "bold 36px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("BẢNG XẾP HẠNG", 256, 55);
+
+  ctx.fillStyle = "#a39e93";
+  ctx.font = "18px sans-serif";
+  ctx.fillText("Chuỗi thắng cao nhất", 256, 85);
+
+  // Header
+  ctx.fillStyle = "#343b4a";
+  ctx.fillRect(24, 105, 464, 36);
+  ctx.fillStyle = "#f3ecdf";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("#", 40, 128);
+  ctx.fillText("Tên", 90, 128);
+  ctx.fillText("Chuỗi", 320, 128);
+  ctx.fillText("Thắng", 410, 128);
+
+  // Rows
+  MOCK_LEADERBOARD.forEach((row, i) => {
+    const y = 155 + i * 48;
+    if (i % 2 === 0) {
+      ctx.fillStyle = "#262d3b";
+      ctx.fillRect(24, y - 18, 464, 44);
+    }
+    ctx.fillStyle = row.rank <= 3 ? "#f0b429" : "#f3ecdf";
+    ctx.font = "bold 20px sans-serif";
+    ctx.fillText(String(row.rank), 40, y + 8);
+    ctx.fillStyle = "#f3ecdf";
+    ctx.font = "18px sans-serif";
+    ctx.fillText(row.name, 90, y + 8);
+    ctx.fillStyle = "#f0b429";
+    ctx.fillText(String(row.streak), 330, y + 8);
+    ctx.fillStyle = "#a39e93";
+    ctx.fillText(String(row.wins), 420, y + 8);
+  });
+
+  // Player highlight at bottom
+  ctx.fillStyle = "#2a3140";
+  ctx.fillRect(24, 560, 464, 50);
+  ctx.fillStyle = "#f0b429";
+  ctx.font = "bold 18px sans-serif";
+  ctx.fillText("Bạn", 40, 590);
+  ctx.fillStyle = "#f3ecdf";
+  ctx.fillText(playerName || "Khách", 90, 590);
+  ctx.fillStyle = "#f0b429";
+  ctx.fillText(String(playerStreak), 330, 590);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+export function Lobby3D(props: Props) {
+  const mountRef = useRef<HTMLDivElement>(null);
+  const [prompt, setPrompt] = useState<string | null>(null);
+  const [code, setCode] = useState("");
+  const [locked, setLocked] = useState(false);
+  const [showBoard, setShowBoard] = useState(false);
+  const [npcTalk, setNpcTalk] = useState<string | null>(null);
+  const keys = useRef<Record<string, boolean>>({});
+  const active = useRef<Interactable | null>(null);
+
+  useEffect(() => {
+    if (!mountRef.current) return;
+
+    const width = mountRef.current.clientWidth;
+    const height = mountRef.current.clientHeight;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x12151c);
+    scene.fog = new THREE.Fog(0x12151c, 18, 45);
+
+    const camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 100);
+    camera.position.set(0, 1.6, 9);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    mountRef.current.appendChild(renderer.domElement);
+
+    // Lights
+    scene.add(new THREE.AmbientLight(0x404050, 0.55));
+    const dir = new THREE.DirectionalLight(0xfff0dd, 1.05);
+    dir.position.set(6, 14, 8);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(1024, 1024);
+    scene.add(dir);
+    const goldLight = new THREE.PointLight(0xf0b429, 1.2, 22);
+    goldLight.position.set(0, 5, -2);
+    scene.add(goldLight);
+
+    // Floor
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(40, 40),
+      new THREE.MeshStandardMaterial({ color: 0x1b202b, roughness: 0.85, metalness: 0.08 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    const grid = new THREE.GridHelper(40, 40, 0x2a3140, 0x1e2430);
+    grid.position.y = 0.01;
+    scene.add(grid);
+
+    // Walls & platforms
+    const wallMat = new THREE.MeshStandardMaterial({ color: 0x262d3b, roughness: 0.7 });
+    const makeBox = (w: number, h: number, d: number, x: number, y: number, z: number) => {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), wallMat);
+      m.position.set(x, y, z);
+      m.castShadow = true;
+      m.receiveShadow = true;
+      scene.add(m);
+      return m;
+    };
+    makeBox(32, 7, 0.5, 0, 3.5, -15); // back wall
+    makeBox(0.5, 7, 20, -16, 3.5, -5); // left
+    makeBox(0.5, 7, 20, 16, 3.5, -5); // right
+    makeBox(4, 0.35, 5, -11, 0.18, 3);
+    makeBox(4, 0.35, 5, 11, 0.18, 3);
+    makeBox(1.4, 4.5, 1.4, 0, 2.25, -7);
+
+    // Neon
+    const neon = (color: number, w: number, x: number, z: number) => {
+      const m = new THREE.Mesh(
+        new THREE.BoxGeometry(w, 0.07, 0.07),
+        new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 1.6 })
+      );
+      m.position.set(x, 0.04, z);
+      scene.add(m);
+    };
+    neon(0xf0b429, 14, 0, -9);
+    neon(0x3c7dff, 4, -5, 4.2);
+    neon(0xe23b3b, 4, 5, 4.2);
+
+    // ===== PADS =====
+    const interactables: Interactable[] = [];
+    const padData = [
+      { mode: "1v1" as const, label: "1v1 · Nhấn E để đấu", color: 0x3c7dff, x: -5, z: 2.5 },
+      { mode: "2v2" as const, label: "2v2 · Nhấn E để đấu", color: 0xe23b3b, x: 5, z: 2.5 },
+      { mode: "daily" as const, label: "Daily Mod · Nhấn E", color: 0xf0b429, x: 0, z: -1.5 },
+    ];
+
+    padData.forEach((p) => {
+      const geo = new THREE.CylinderGeometry(1.35, 1.35, 0.16, 32);
+      const mat = new THREE.MeshStandardMaterial({
+        color: p.color,
+        emissive: p.color,
+        emissiveIntensity: 0.65,
+        roughness: 0.35,
+        metalness: 0.25,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(p.x, 0.09, p.z);
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(1.45, 1.65, 32),
+        new THREE.MeshBasicMaterial({ color: p.color, side: THREE.DoubleSide, transparent: true, opacity: 0.45 })
+      );
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.set(p.x, 0.11, p.z);
+      scene.add(ring);
+
+      interactables.push({
+        kind: "pad",
+        mesh,
+        label: p.label,
+        mode: p.mode,
+        pos: new THREE.Vector3(p.x, 0, p.z),
+        color: p.color,
+      });
+    });
+
+    // ===== NPCs =====
+    const npcSensei = createNpc(scene, -8, -6, 0x4a5568, "Sensei");
+    interactables.push({
+      kind: "npc",
+      mesh: npcSensei,
+      label: "Sensei · Nhấn E để nói chuyện",
+      pos: new THREE.Vector3(-8, 0, -6),
+    });
+
+    const npcVendor = createNpc(scene, 8, -5.5, 0x2d6a4f, "Vendor");
+    interactables.push({
+      kind: "npc",
+      mesh: npcVendor,
+      label: "Vendor · Nhấn E (mở Kho vũ khí)",
+      pos: new THREE.Vector3(8, 0, -5.5),
+    });
+
+    const npcCoach = createNpc(scene, -3, -9, 0x7c3aed, "Coach");
+    interactables.push({
+      kind: "npc",
+      mesh: npcCoach,
+      label: "Coach · Nhấn E để nhận tip",
+      pos: new THREE.Vector3(-3, 0, -9),
+    });
+
+    // ===== LEADERBOARD BOARD =====
+    const boardTex = createLeaderboardTexture(props.profile.name, props.profile.streak);
+    const boardMat = new THREE.MeshBasicMaterial({ map: boardTex });
+    const board = new THREE.Mesh(new THREE.PlaneGeometry(5.5, 6.8), boardMat);
+    board.position.set(0, 3.6, -14.6);
+    scene.add(board);
+
+    // Board frame
+    const frame = new THREE.Mesh(
+      new THREE.BoxGeometry(5.9, 7.2, 0.15),
+      new THREE.MeshStandardMaterial({ color: 0x1a1e28, metalness: 0.4, roughness: 0.5 })
+    );
+    frame.position.set(0, 3.6, -14.75);
+    scene.add(frame);
+
+    interactables.push({
+      kind: "board",
+      mesh: board,
+      label: "Bảng xếp hạng · Nhấn E để xem",
+      pos: new THREE.Vector3(0, 0, -12),
+    });
+
+    // Player movement state
+    const velocity = new THREE.Vector3();
+    const direction = new THREE.Vector3();
+    let yaw = 0;
+    let pitch = 0;
+    const SPEED = 6.8;
+    const eyeHeight = 1.6;
+
+    const onLockChange = () => {
+      setLocked(document.pointerLockElement === renderer.domElement);
+    };
+    document.addEventListener("pointerlockchange", onLockChange);
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (document.pointerLockElement !== renderer.domElement) return;
+      yaw -= e.movementX * 0.0022;
+      pitch -= e.movementY * 0.0022;
+      pitch = Math.max(-1.15, Math.min(1.15, pitch));
+    };
+    document.addEventListener("mousemove", onMouseMove);
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      keys.current[e.code] = true;
+      if (e.code === "KeyE" && active.current) {
+        const target = active.current;
+        unlockAudio();
+        playUi();
+        if (target.kind === "pad") {
+          if (target.mode === "1v1") props.onSolo();
+          else if (target.mode === "2v2") props.onDuo();
+          else if (target.mode === "daily") props.onDaily();
+        } else if (target.kind === "npc") {
+          if (target.label.includes("Vendor")) {
+            props.onArmory();
+          } else if (target.label.includes("Sensei")) {
+            setNpcTalk("Sensei: Giữ crosshair ổn định, đừng spray. 1-2 viên chính xác hơn cả magazine.");
+            setTimeout(() => setNpcTalk(null), 5000);
+          } else if (target.label.includes("Coach")) {
+            setNpcTalk("Coach: Di chuyển luôn! Đứng yên = thành bia. Strafe + counter-strafe là chìa khóa.");
+            setTimeout(() => setNpcTalk(null), 5000);
+          }
+        } else if (target.kind === "board") {
+          setShowBoard(true);
+        }
+      }
+      if (e.code === "Escape") {
+        setShowBoard(false);
+        setNpcTalk(null);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      keys.current[e.code] = false;
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+
+    const onClick = () => {
+      if (document.pointerLockElement !== renderer.domElement) {
+        renderer.domElement.requestPointerLock();
+      }
+    };
+    renderer.domElement.addEventListener("click", onClick);
+
+    const onResize = () => {
+      if (!mountRef.current) return;
+      const w = mountRef.current.clientWidth;
+      const h = mountRef.current.clientHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    };
+    window.addEventListener("resize", onResize);
+
+    let last = performance.now();
+    let animId = 0;
+
+    const tick = (now: number) => {
+      const dt = Math.min((now - last) / 1000, 0.1);
+      last = now;
+
+      // Movement
+      direction.set(0, 0, 0);
+      if (keys.current["KeyW"] || keys.current["ArrowUp"]) direction.z -= 1;
+      if (keys.current["KeyS"] || keys.current["ArrowDown"]) direction.z += 1;
+      if (keys.current["KeyA"] || keys.current["ArrowLeft"]) direction.x -= 1;
+      if (keys.current["KeyD"] || keys.current["ArrowRight"]) direction.x += 1;
+      if (direction.lengthSq() > 0) direction.normalize();
+
+      const sin = Math.sin(yaw);
+      const cos = Math.cos(yaw);
+      const moveX = direction.x * cos + direction.z * sin;
+      const moveZ = direction.z * cos - direction.x * sin;
+
+      camera.position.x += moveX * SPEED * dt;
+      camera.position.z += moveZ * SPEED * dt;
+      camera.position.x = Math.max(-14.5, Math.min(14.5, camera.position.x));
+      camera.position.z = Math.max(-13, Math.min(12, camera.position.z));
+      camera.position.y = eyeHeight;
+
+      camera.rotation.order = "YXZ";
+      camera.rotation.y = yaw;
+      camera.rotation.x = pitch;
+
+      // NPC head look (simple)
+      [npcSensei, npcVendor, npcCoach].forEach((npc) => {
+        const plate = npc.children[2];
+        if (plate) plate.lookAt(camera.position.x, plate.position.y + npc.position.y, camera.position.z);
+      });
+
+      // Detect nearest interactable
+      let nearest: Interactable | null = null;
+      let minDist = 2.2;
+      for (const item of interactables) {
+        const dx = camera.position.x - item.pos.x;
+        const dz = camera.position.z - item.pos.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < minDist) {
+          minDist = dist;
+          nearest = item;
+        }
+        if (item.kind === "pad" && item.mesh instanceof THREE.Mesh) {
+          const mat = item.mesh.material as THREE.MeshStandardMaterial;
+          mat.emissiveIntensity = 0.5 + Math.sin(now * 0.004) * 0.3;
+        }
+      }
+      active.current = nearest;
+      setPrompt(nearest ? nearest.label : null);
+
+      renderer.render(scene, camera);
+      animId = requestAnimationFrame(tick);
+    };
+    animId = requestAnimationFrame(tick);
+
+    return () => {
+      cancelAnimationFrame(animId);
+      document.removeEventListener("pointerlockchange", onLockChange);
+      document.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("resize", onResize);
+      renderer.domElement.removeEventListener("click", onClick);
+      if (document.pointerLockElement === renderer.domElement) document.exitPointerLock();
+      renderer.dispose();
+      if (mountRef.current && renderer.domElement.parentNode === mountRef.current) {
+        mountRef.current.removeChild(renderer.domElement);
+      }
+    };
+  }, [props.onSolo, props.onDuo, props.onDaily, props.onArmory, props.profile.name, props.profile.streak]);
+
+  return (
+    <div className="relative h-full w-full overflow-hidden bg-bg">
+      <div ref={mountRef} className="absolute inset-0" />
+
+      {/* Click to enter */}
+      {!locked && (
+        <div
+          className="absolute inset-0 z-20 flex cursor-pointer flex-col items-center justify-center bg-black/65"
+          onClick={() => {
+            const canvas = mountRef.current?.querySelector("canvas");
+            canvas?.requestPointerLock();
+          }}
+        >
+          <p className="font-display text-3xl text-gold">DUELFORGE</p>
+          <p className="mt-2 text-lg text-fg">Click để vào sảnh 3D</p>
+          <p className="mt-1 text-sm text-muted">WASD di chuyển · Chuột nhìn · E tương tác</p>
+        </div>
+      )}
+
+      {/* Top bar */}
+      <div className="pointer-events-none absolute left-0 right-0 top-0 z-10 flex items-start justify-between p-4">
+        <div>
+          <h1 className="font-display text-2xl tracking-wide text-fg">DUELFORGE</h1>
+          <p className="text-xs text-muted">Sảnh 3D · NPC + Bảng xếp hạng</p>
+        </div>
+        <div className="pointer-events-auto flex items-center gap-2 rounded-full border border-line bg-surface/90 px-3 py-1.5 backdrop-blur">
+          <KeyRound className="size-4 text-gold" />
+          <span className="font-display text-lg text-gold">{props.profile.keys}</span>
+          <span className="text-xs text-muted">chuỗi {props.profile.streak}</span>
+        </div>
+      </div>
+
+      {/* Interaction prompt */}
+      {prompt && locked && !showBoard && (
+        <div className="absolute bottom-28 left-1/2 z-10 -translate-x-1/2 rounded-lg border border-gold/40 bg-surface/90 px-5 py-2.5 text-center backdrop-blur">
+          <p className="font-display text-lg text-gold">{prompt}</p>
+        </div>
+      )}
+
+      {/* NPC talk bubble */}
+      {npcTalk && (
+        <div className="absolute left-1/2 top-24 z-20 w-[min(90vw,420px)] -translate-x-1/2 rounded-xl border border-line bg-surface/95 p-4 shadow-lg backdrop-blur">
+          <p className="text-sm leading-relaxed text-fg">{npcTalk}</p>
+          <p className="mt-2 text-xs text-muted">Nhấn Esc để đóng</p>
+        </div>
+      )}
+
+      {/* Leaderboard modal */}
+      {showBoard && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-md rounded-xl border border-gold/50 bg-surface p-5 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="flex items-center gap-2 font-display text-xl text-gold">
+                <Trophy className="size-5" /> Bảng xếp hạng
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowBoard(false)}
+                className="rounded bg-surface-2 px-2 py-1 text-sm text-muted hover:text-fg"
+              >
+                Đóng (Esc)
+              </button>
+            </div>
+            <div className="space-y-1 text-sm">
+              <div className="grid grid-cols-[2rem_1fr_4rem_4rem] gap-2 border-b border-line pb-2 text-muted">
+                <span>#</span>
+                <span>Tên</span>
+                <span className="text-right">Chuỗi</span>
+                <span className="text-right">Thắng</span>
+              </div>
+              {MOCK_LEADERBOARD.map((row) => (
+                <div
+                  key={row.rank}
+                  className="grid grid-cols-[2rem_1fr_4rem_4rem] gap-2 py-1.5"
+                >
+                  <span className={row.rank <= 3 ? "font-bold text-gold" : "text-muted"}>
+                    {row.rank}
+                  </span>
+                  <span className="truncate text-fg">{row.name}</span>
+                  <span className="text-right text-gold">{row.streak}</span>
+                  <span className="text-right text-muted">{row.wins}</span>
+                </div>
+              ))}
+              <div className="mt-3 grid grid-cols-[2rem_1fr_4rem_4rem] gap-2 border-t border-line pt-3">
+                <span className="text-gold">•</span>
+                <span className="font-medium text-fg">{props.profile.name || "Khách"} (bạn)</span>
+                <span className="text-right text-gold">{props.profile.streak}</span>
+                <span className="text-right text-muted">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bottom bar */}
+      <div className="absolute bottom-0 left-0 right-0 z-10 border-t border-line bg-surface/95 p-3 backdrop-blur">
+        <div className="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3">
+          <label className="text-xs text-muted">
+            Tên
+            <input
+              value={props.profile.name}
+              maxLength={14}
+              onChange={(e) => props.setProfile({ ...props.profile, name: e.target.value.slice(0, 14) })}
+              className="ml-2 w-28 rounded border border-line bg-bg px-2 py-1 text-sm text-fg outline-none"
+            />
+          </label>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                unlockAudio();
+                playUi();
+                props.onArmory();
+              }}
+              className="flex items-center gap-1.5 rounded-lg bg-surface-2 px-3 py-1.5 text-sm hover:bg-line"
+            >
+              <Package className="size-4" /> Kho vũ khí
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                unlockAudio();
+                playUi();
+                props.onContracts();
+              }}
+              className="flex items-center gap-1.5 rounded-lg bg-surface-2 px-3 py-1.5 text-sm hover:bg-line"
+            >
+              <ScrollText className="size-4" /> Hợp đồng
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                unlockAudio();
+                playUi();
+                props.onRoom();
+              }}
+              className="flex items-center gap-1.5 rounded-lg bg-gold px-3 py-1.5 text-sm text-gold-ink"
+            >
+              <DoorOpen className="size-4" /> Tạo phòng
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              value={code}
+              maxLength={4}
+              placeholder="MÃ"
+              onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4))}
+              className="w-20 rounded border border-line bg-bg px-2 py-1 text-center font-display tracking-widest text-fg outline-none"
+            />
+            <button
+              type="button"
+              disabled={code.length < 4}
+              onClick={() => props.onJoin(code)}
+              className="rounded-lg bg-surface-2 px-3 py-1.5 text-sm disabled:opacity-40"
+            >
+              Vào
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {locked && !showBoard && (
+        <div className="absolute bottom-20 left-4 z-10 text-xs text-muted">
+          WASD · Chuột · E tương tác · Esc đóng
+        </div>
+      )}
+    </div>
+  );
+}
+
+let ctx: AudioContext | null = null;
+let master: GainNode | null = null;
+let sfx: GainNode | null = null;
+let volume = 0.8;
+
+function ensure(): AudioContext | null {
+  if (typeof window === "undefined") return null;
+  if (!ctx) {
+    const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    ctx = new AC();
+    master = ctx.createGain();
+    sfx = ctx.createGain();
+    sfx.gain.value = volume * volume;
+    sfx.connect(master);
+    master.connect(ctx.destination);
+  }
+  return ctx;
+}
+
+export function unlockAudio() {
+  const c = ensure();
+  if (c && c.state === "suspended") void c.resume();
+}
+
+export function setVolume(v: number) {
+  volume = Math.min(1, Math.max(0, v));
+  if (sfx) sfx.gain.value = volume * volume;
+}
+
+function envGain(duration: number, peak: number): GainNode | null {
+  const c = ensure();
+  if (!c || !sfx) return null;
+  const g = c.createGain();
+  g.connect(sfx);
+  const t = c.currentTime;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.001, peak), t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+  return g;
+}
+
+function tone(freq: number, dur: number, type: OscillatorType, peak: number, slide = 0) {
+  const c = ensure();
+  const g = envGain(dur, peak);
+  if (!c || !g) return;
+  const o = c.createOscillator();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, c.currentTime);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, freq + slide), c.currentTime + dur);
+  o.connect(g);
+  o.start();
+  o.stop(c.currentTime + dur + 0.02);
+}
+
+function noise(dur: number, peak: number, hp = 0) {
+  const c = ensure();
+  const g = envGain(dur, peak);
+  if (!c || !g) return;
+  const n = c.createBuffer(1, Math.floor(c.sampleRate * dur), c.sampleRate);
+  const data = n.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  const src = c.createBufferSource();
+  src.buffer = n;
+  if (hp > 0) {
+    const f = c.createBiquadFilter();
+    f.type = "highpass";
+    f.frequency.value = hp;
+    src.connect(f);
+    f.connect(g);
+  } else src.connect(g);
+  src.start();
+}
+
+export function playShot(kind: string) {
+  const wobble = 0.92 + Math.random() * 0.16;
+  if (kind === "blade") {
+    noise(0.12, 0.35, 800);
+    tone(220 * wobble, 0.1, "sawtooth", 0.12, -80);
+    return;
+  }
+  if (kind === "scatter") {
+    noise(0.16, 0.5, 200);
+    tone(90, 0.12, "square", 0.18, -40);
+    return;
+  }
+  if (kind === "glassline") {
+    noise(0.18, 0.4, 400);
+    tone(140, 0.2, "triangle", 0.2, -60);
+    return;
+  }
+  if (kind === "tube" || kind === "pop") {
+    tone(180, 0.16, "square", 0.16, -100);
+    noise(0.14, 0.28, 100);
+    return;
+  }
+  noise(0.07, kind === "stinger" ? 0.22 : 0.32, 500);
+  tone((kind === "drum" ? 160 : 240) * wobble, 0.06, "square", 0.1, -70);
+}
+
+export function playHit(head: boolean) {
+  tone(head ? 880 : 620, 0.07, "square", head ? 0.16 : 0.1);
+}
+
+export function playHurt() {
+  noise(0.12, 0.3, 100);
+  tone(90, 0.14, "sawtooth", 0.12, -30);
+}
+
+export function playBoom() {
+  noise(0.35, 0.55, 40);
+  tone(70, 0.4, "sine", 0.3, -40);
+}
+
+export function playKill() {
+  tone(523, 0.08, "square", 0.1);
+  setTimeout(() => tone(784, 0.1, "square", 0.1), 70);
+}
+
+export function playBeep(high: boolean) {
+  tone(high ? 740 : 420, 0.08, "square", 0.08);
+}
+
+export function playUi() {
+  tone(540, 0.05, "square", 0.06);
+}
+
+export function playStep() {
+  noise(0.05, 0.08, 180);
+  tone(90, 0.04, "sine", 0.04);
+}
+
+export function playEmpty() {
+  tone(180, 0.04, "square", 0.05);
+}
+
+export function resumeAudio() {
+  if (ctx && ctx.state === "suspended") void ctx.resume();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pointerdown", unlockAudio);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") resumeAudio();
+  });
+}
+
+export type SlotKind = "primary" | "secondary";
+export type WeaponKind = "hitscan" | "melee" | "proj";
+export type ModId = "classic" | "glass" | "moon" | "cutter";
+export type ModeId = "1v1" | "2v2";
+
+export interface WeaponDef {
+  id: string;
+  name: string;
+  blurb: string;
+  kind: WeaponKind;
+  slot: SlotKind;
+  cost: number;
+  dmg: number;
+  rpm: number;
+  mag: number;
+  reserve: number;
+  reload: number;
+  spread: number;
+  recoil: number;
+  auto?: boolean;
+  burst?: number;
+  pellets?: number;
+  ads?: boolean;
+  proj?: "grenade" | "rocket";
+  speed?: number;
+  radius?: number;
+  fuse?: number;
+  range: number;
+}
+
+export interface Box {
+  minX: number;
+  minY: number;
+  minZ: number;
+  maxX: number;
+  maxY: number;
+  maxZ: number;
+  color: number;
+  solid: boolean;
+}
+
+export interface ArenaMap {
+  id: string;
+  name: string;
+  blurb: string;
+  sky: number;
+  floor: number;
+  boxes: Box[];
+  spawns: [{ x: number; z: number }[], { x: number; z: number }[]];
+}
+
+export const WEAPONS: WeaponDef[] = [
+  {
+    id: "rifle",
+    name: "Service",
+    blurb: "Súng trường liên thanh, ổn ở mọi khoảng.",
+    kind: "hitscan",
+    slot: "primary",
+    cost: 0,
+    dmg: 16,
+    rpm: 620,
+    mag: 30,
+    reserve: 90,
+    reload: 1.55,
+    spread: 0.014,
+    recoil: 0.012,
+    auto: true,
+    range: 90,
+  },
+  {
+    id: "sidearm",
+    name: "Snap",
+    blurb: "Súng ngắn tin cậy khi hết băng chính.",
+    kind: "hitscan",
+    slot: "secondary",
+    cost: 0,
+    dmg: 22,
+    rpm: 380,
+    mag: 14,
+    reserve: 56,
+    reload: 1.25,
+    spread: 0.008,
+    recoil: 0.02,
+    range: 60,
+  },
+  {
+    id: "blade",
+    name: "Cutter",
+    blurb: "Nhát gần, sát thương nặng.",
+    kind: "melee",
+    slot: "secondary",
+    cost: 0,
+    dmg: 62,
+    rpm: 110,
+    mag: 0,
+    reserve: 0,
+    reload: 0,
+    spread: 0,
+    recoil: 0,
+    range: 2.45,
+  },
+  {
+    id: "scatter",
+    name: "Breacher",
+    blurb: "Sát thương khủng sát vách, yếu khi xa.",
+    kind: "hitscan",
+    slot: "primary",
+    cost: 20,
+    dmg: 10,
+    rpm: 78,
+    mag: 6,
+    reserve: 24,
+    reload: 1.9,
+    spread: 0.1,
+    recoil: 0.04,
+    pellets: 8,
+    range: 28,
+  },
+  {
+    id: "stinger",
+    name: "Stinger",
+    blurb: "Tiểu liên rất nhanh, giật mạnh.",
+    kind: "hitscan",
+    slot: "primary",
+    cost: 25,
+    dmg: 11,
+    rpm: 920,
+    mag: 28,
+    reserve: 84,
+    reload: 1.45,
+    spread: 0.03,
+    recoil: 0.01,
+    auto: true,
+    range: 45,
+  },
+  {
+    id: "drum",
+    name: "Drum Six",
+    blurb: "Ổ quay chậm, một phát đau.",
+    kind: "hitscan",
+    slot: "secondary",
+    cost: 35,
+    dmg: 46,
+    rpm: 150,
+    mag: 6,
+    reserve: 24,
+    reload: 1.7,
+    spread: 0.004,
+    recoil: 0.045,
+    range: 70,
+  },
+  {
+    id: "triline",
+    name: "Tri-Line",
+    blurb: "Ba viên mỗi nhịp, chính xác.",
+    kind: "hitscan",
+    slot: "primary",
+    cost: 40,
+    dmg: 15,
+    rpm: 520,
+    mag: 24,
+    reserve: 72,
+    reload: 1.6,
+    spread: 0.01,
+    recoil: 0.014,
+    burst: 3,
+    range: 80,
+  },
+  {
+    id: "pop",
+    name: "Pop Can",
+    blurb: "Lựu nảy, nổ trễ. Không tự sát thương.",
+    kind: "proj",
+    slot: "secondary",
+    cost: 30,
+    dmg: 86,
+    rpm: 50,
+    mag: 1,
+    reserve: 2,
+    reload: 1.15,
+    spread: 0,
+    recoil: 0.02,
+    proj: "grenade",
+    speed: 16,
+    radius: 4.4,
+    fuse: 1.55,
+    range: 30,
+  },
+  {
+    id: "tube",
+    name: "Tube",
+    blurb: "Ống phóng chậm, nổ khi chạm.",
+    kind: "proj",
+    slot: "primary",
+    cost: 55,
+    dmg: 98,
+    rpm: 40,
+    mag: 1,
+    reserve: 3,
+    reload: 2.15,
+    spread: 0,
+    recoil: 0.05,
+    proj: "rocket",
+    speed: 28,
+    radius: 3.3,
+    range: 80,
+  },
+  {
+    id: "glassline",
+    name: "Glassline",
+    blurb: "Ống ngắm. Headshot kết liễu.",
+    kind: "hitscan",
+    slot: "primary",
+    cost: 75,
+    dmg: 90,
+    rpm: 48,
+    mag: 5,
+    reserve: 15,
+    reload: 2.3,
+    spread: 0.001,
+    recoil: 0.06,
+    ads: true,
+    range: 160,
+  },
+];
+
+export const WEAPON_MAP: Record<string, WeaponDef> = Object.fromEntries(
+  WEAPONS.map((w) => [w.id, w]),
+);
+
+export function weapon(id: string): WeaponDef {
+  return WEAPON_MAP[id] ?? WEAPONS[0];
+}
+
+export interface Dye {
+  id: string;
+  name: string;
+  hex: string;
+  cost: number;
+}
+
+export const DYES: Dye[] = [
+  { id: "ember", name: "Than đỏ", hex: "#e23b3b", cost: 0 },
+  { id: "tide", name: "Triều", hex: "#3c7dff", cost: 0 },
+  { id: "gold", name: "Khóa vàng", hex: "#f0b429", cost: 20 },
+  { id: "mint", name: "Bạc hà", hex: "#3dbe8b", cost: 20 },
+  { id: "ivory", name: "Ngà", hex: "#f3ecdf", cost: 30 },
+  { id: "ink", name: "Mực", hex: "#2a3142", cost: 15 },
+];
+
+export const MODS: { id: ModId; name: string; blurb: string }[] = [
+  { id: "classic", name: "Cổ điển", blurb: "Loadout của bạn, trọng lực thường." },
+  { id: "glass", name: "Kính vỡ", blurb: "Chỉ Glassline. Trúng một phát là gục." },
+  { id: "moon", name: "Sân trăng", blurb: "Nhảy cao, rơi chậm." },
+  { id: "cutter", name: "Chỉ lưỡi", blurb: "Cận chiến. Cutter cho mọi người." },
+];
+
+export function dailyMod(date = new Date()): ModId {
+  const start = Date.UTC(date.getFullYear(), 0, 0);
+  const day = Math.floor((date.getTime() - start) / 86_400_000);
+  return (["glass", "moon", "cutter"] as const)[day % 3];
+}
+
+const BOT_NAMES = ["Vesper", "Kite", "Nock", "Pylon", "Marrow", "Quill"];
+const BOT_KITS: [string, string][] = [
+  ["rifle", "sidearm"],
+  ["scatter", "drum"],
+  ["stinger", "sidearm"],
+  ["triline", "blade"],
+  ["tube", "sidearm"],
+  ["glassline", "sidearm"],
+];
+
+export function botName(i: number): string {
+  return BOT_NAMES[i % BOT_NAMES.length];
+}
+
+export function botKit(i: number): [string, string] {
+  return BOT_KITS[i % BOT_KITS.length];
+}
+
+function box(
+  cx: number,
+  cz: number,
+  w: number,
+  d: number,
+  h: number,
+  color: number,
+  y = 0,
+  solid = true,
+): Box {
+  return {
+    minX: cx - w / 2,
+    maxX: cx + w / 2,
+    minY: y,
+    maxY: y + h,
+    minZ: cz - d / 2,
+    maxZ: cz + d / 2,
+    color,
+    solid,
+  };
+}
+
+function bounds(halfX: number, halfZ: number, floor: number, wall: number): Box[] {
+  const t = 1.2;
+  const h = 4.2;
+  const x = halfX + t;
+  const z = halfZ + t;
+  return [
+    {
+      minX: -x,
+      maxX: x,
+      minY: -8,
+      maxY: 0,
+      minZ: -z,
+      maxZ: z,
+      color: floor,
+      solid: true,
+    },
+    box(0, halfZ + t / 2, halfX * 2 + t * 2, t, h, wall),
+    box(0, -(halfZ + t / 2), halfX * 2 + t * 2, t, h, wall),
+    box(halfX + t / 2, 0, t, halfZ * 2, h, wall),
+    box(-(halfX + t / 2), 0, t, halfZ * 2, h, wall),
+  ];
+}
+
+const C = {
+  concrete: 0x3a4252,
+  concreteDark: 0x2c3340,
+  crate: 0x8a5a32,
+  crate2: 0x6e4528,
+  metal: 0x596579,
+  accent: 0xc4552a,
+  teal: 0x2f6f66,
+  sand: 0x4a463c,
+  night: 0x32384a,
+  pillar: 0x4e5668,
+  gold: 0xb8892e,
+};
+
+export const MAPS: ArenaMap[] = [
+  {
+    id: "roof",
+    name: "Mái Nhà",
+    blurb: "Sân vuông, thùng giữa, trụ bốn góc.",
+    sky: 0x1a2030,
+    floor: 0x343b4a,
+    spawns: [
+      [
+        { x: -3.2, z: 15 },
+        { x: 3.2, z: 15 },
+      ],
+      [
+        { x: -3.2, z: -15 },
+        { x: 3.2, z: -15 },
+      ],
+    ],
+    boxes: [
+      ...bounds(18, 18, C.concreteDark, C.concrete),
+      box(0, 0, 2.4, 2.4, 1.05, C.crate),
+      box(-7.2, -7.2, 1.5, 1.5, 3.1, C.pillar),
+      box(7.2, -7.2, 1.5, 1.5, 3.1, C.pillar),
+      box(-7.2, 7.2, 1.5, 1.5, 3.1, C.pillar),
+      box(7.2, 7.2, 1.5, 1.5, 3.1, C.pillar),
+      box(-11, 0, 3.2, 1.3, 1.05, C.metal),
+      box(11, 0, 3.2, 1.3, 1.05, C.metal),
+      box(0, -10.5, 5, 0.7, 1.15, C.crate2),
+      box(0, 10.5, 5, 0.7, 1.15, C.crate2),
+    ],
+  },
+  {
+    id: "dock",
+    name: "Kho Hàng",
+    blurb: "Hai làn container. Đánh gần hoặc ôm góc.",
+    sky: 0x1c2428,
+    floor: 0x3a4038,
+    spawns: [
+      [
+        { x: -4, z: 20 },
+        { x: 4, z: 20 },
+      ],
+      [
+        { x: -4, z: -20 },
+        { x: 4, z: -20 },
+      ],
+    ],
+    boxes: [
+      ...bounds(14, 24, C.sand, C.metal),
+      box(-6.2, 8, 3.4, 8, 2.5, C.teal),
+      box(6.2, 8, 3.4, 8, 2.5, C.crate),
+      box(-6.2, -8, 3.4, 8, 2.5, C.crate2),
+      box(6.2, -8, 3.4, 8, 2.5, C.teal),
+      box(0, 0, 2.2, 2.2, 1.05, C.gold),
+      box(-10, 0, 1.4, 4, 1.05, C.metal),
+      box(10, 0, 1.4, 4, 1.05, C.metal),
+    ],
+  },
+  {
+    id: "court",
+    name: "Sân Đêm",
+    blurb: "Trụ đối xứng, đường giữa thoáng.",
+    sky: 0x141824,
+    floor: 0x2a3144,
+    spawns: [
+      [
+        { x: -5, z: 16 },
+        { x: 5, z: 16 },
+      ],
+      [
+        { x: -5, z: -16 },
+        { x: 5, z: -16 },
+      ],
+    ],
+    boxes: [
+      ...bounds(18, 18, C.night, C.pillar),
+      box(-5, 0, 1.3, 1.3, 2.8, C.accent),
+      box(5, 0, 1.3, 1.3, 2.8, C.accent),
+      box(0, -6, 1.3, 1.3, 2.8, C.pillar),
+      box(0, 6, 1.3, 1.3, 2.8, C.pillar),
+      box(-12, -8, 2.4, 2.4, 1.05, C.metal),
+      box(12, -8, 2.4, 2.4, 1.05, C.metal),
+      box(-12, 8, 2.4, 2.4, 1.05, C.metal),
+      box(12, 8, 2.4, 2.4, 1.05, C.metal),
+      box(0, 0, 3.2, 0.55, 1.1, C.gold),
+    ],
+  },
+];
+
+export const MAP_LOOKUP: Record<string, ArenaMap> = Object.fromEntries(MAPS.map((m) => [m.id, m]));
+
+export function mapById(id: string): ArenaMap {
+  return MAP_LOOKUP[id] ?? MAPS[0];
+}
+
+export interface SlotConfig {
+  id: string;
+  name: string;
+  team: 0 | 1;
+  bot: boolean;
+  color: string;
+  weapons: [string, string];
+}
+
+export interface MatchConfig {
+  mode: ModeId;
+  mapId: string;
+  mod: ModId;
+  slots: SlotConfig[];
+  selfId: string;
+  nonce: number;
+}
+
+export function solidBoxes(map: ArenaMap): Box[] {
+  return map.boxes.filter((b) => b.solid);
+}
+
+import { useRef, type PointerEvent as PE, type ReactNode } from "react";
+import { bus } from "./input";
+import type { HudModel } from "./session";
+
+export function Hud({ hud, coarse }: { hud: HudModel; coarse: boolean }) {
+  const gap = 6 + hud.heat * 14 + (hud.ads ? -4 : 0);
+  const banner =
+    hud.phase === "count"
+      ? String(Math.max(1, Math.ceil(hud.phaseT)))
+      : hud.phase === "fight" && hud.fightTime < 0.9
+        ? "ĐẤU"
+        : hud.phase === "gap"
+          ? hud.gapTeam === null
+            ? "HÒA HIỆP"
+            : hud.gapTeam === hud.myTeam
+              ? "HIỆP CỦA BẠN"
+              : "MẤT HIỆP"
+          : hud.phase === "end"
+            ? hud.winner === hud.myTeam
+              ? "THẮNG"
+              : "THUA"
+            : "";
+
+  return (
+    <div className="pointer-events-none absolute inset-0 z-20 text-fg" data-ui>
+      <div className="absolute top-4 left-1/2 flex -translate-x-1/2 items-center gap-4 rounded-xl border border-line bg-bg/80 px-4 py-2 backdrop-blur-sm">
+        <Score n={hud.scores[0]} hot={hud.myTeam === 0} tone="text-team-red" />
+        <div className="text-center">
+          <div className="font-display text-xs tracking-widest text-muted">TỚI 5</div>
+          <div className="font-display text-sm text-gold">Hiệp {hud.round}</div>
+        </div>
+        <Score n={hud.scores[1]} hot={hud.myTeam === 1} tone="text-team-blue" />
+      </div>
+
+      {banner && (
+        <div className="absolute top-[22%] left-1/2 -translate-x-1/2 font-display text-6xl text-fg drop-shadow-sm">
+          {banner}
+        </div>
+      )}
+
+      <div className="absolute top-4 right-4 flex w-56 flex-col gap-1 text-right text-sm">
+        {hud.feed.map((line) => (
+          <div key={line.id} className={line.mine ? "text-gold" : "text-fg/90"}>
+            {line.text}
+          </div>
+        ))}
+      </div>
+
+      {!hud.alive && hud.phase === "fight" && (
+        <div className="absolute top-[30%] left-1/2 -translate-x-1/2 text-center">
+          <div className="font-display text-3xl">BẠN ĐÃ GỤC</div>
+          <p className="text-muted">Chờ hết hiệp</p>
+        </div>
+      )}
+
+      <div
+        className="absolute top-1/2 left-1/2"
+        style={{ transform: "translate(-50%, -50%)" }}
+      >
+        <Cross gap={gap} hit={hud.hit} head={hud.head} />
+      </div>
+
+      <div
+        className="absolute inset-0"
+        style={{
+          background: `radial-gradient(circle at center, transparent 40%, rgba(226,59,59,${Math.min(0.55, hud.hurt * 0.55)}) 100%)`,
+        }}
+      />
+
+      <div className="absolute bottom-4 left-4 flex items-end gap-3">
+        <div>
+          <div className="font-display text-4xl leading-none">{Math.ceil(hud.hp)}</div>
+          <div className="mt-1 h-2 w-40 overflow-hidden rounded-full bg-surface-2">
+            <div
+              className="h-full bg-team-red"
+              style={{ width: `${Math.max(0, Math.min(100, (hud.hp / hud.maxHp) * 100))}%` }}
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="absolute right-4 bottom-4 text-right">
+        <div className="font-display text-lg text-gold">{hud.weaponName}</div>
+        <div className="font-display text-4xl leading-none">
+          {hud.weaponName === "Cutter" ? "—" : hud.reloading ? "…" : hud.mag}
+          <span className="ml-2 text-xl text-muted">{hud.weaponName === "Cutter" ? "" : hud.reserve}</span>
+        </div>
+        <div className="text-xs text-muted">{hud.reloading ? "Đang nạp" : `Súng ${hud.slot + 1}`}</div>
+      </div>
+
+      {!coarse && (
+        <div className="absolute bottom-4 left-1/2 hidden -translate-x-1/2 text-center text-xs text-muted md:block">
+          WASD di chuyển · Chuột ngắm · Click bắn · R nạp · Q đổi · F chém · Shift chạy · Space nhảy
+        </div>
+      )}
+
+      {coarse && <TouchPad />}
+    </div>
+  );
+}
+
+function Score({ n, hot, tone }: { n: number; hot: boolean; tone: string }) {
+  return (
+    <div className={`font-display text-4xl leading-none ${tone} ${hot ? "" : "opacity-80"}`}>{n}</div>
+  );
+}
+
+function Cross({ gap, hit, head }: { gap: number; hit: number; head: boolean }) {
+  const arm = (cls: string) => (
+    <span className={`absolute h-0.5 w-2.5 bg-fg ${cls}`} style={{ opacity: 0.9 }} />
+  );
+  return (
+    <div className="relative h-8 w-8">
+      <span className="absolute top-1/2 left-1/2 h-1 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-fg" />
+      <span className="absolute top-1/2 left-1/2" style={{ transform: `translate(-50%, -50%) translateX(${-gap - 8}px)` }}>
+        {arm("")}
+      </span>
+      <span className="absolute top-1/2 left-1/2 h-0.5 w-2.5 bg-fg" style={{ transform: `translate(calc(-50% + ${gap + 8}px), -50%)` }} />
+      <span className="absolute top-1/2 left-1/2 h-2.5 w-0.5 bg-fg" style={{ transform: `translate(-50%, calc(-50% - ${gap + 8}px))` }} />
+      <span className="absolute top-1/2 left-1/2 h-2.5 w-0.5 bg-fg" style={{ transform: `translate(-50%, calc(-50% + ${gap + 8}px))` }} />
+      {hit > 0.2 && (
+        <span
+          className={`absolute top-1/2 left-1/2 h-6 w-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 ${head ? "border-gold" : "border-fg"}`}
+          style={{ opacity: hit }}
+        />
+      )}
+    </div>
+  );
+}
+
+function TouchPad() {
+  return (
+    <div className="pointer-events-auto absolute inset-0" data-ui>
+      <LookZone />
+      <Stick />
+      <div className="absolute right-3 bottom-3 flex flex-col items-end gap-2">
+        <Row>
+          <Pad label="Ngắm" onDown={() => (bus.adsTouch = true)} onUp={() => (bus.adsTouch = false)} />
+          <Pad label="Chém" onDown={() => bus.meleeEdge++} />
+        </Row>
+        <Row>
+          <Pad label="Nhảy" onDown={() => bus.jumpEdge++} />
+          <Pad label="Đổi" onDown={() => bus.swapEdge++} />
+          <Pad label="Nạp" onDown={() => bus.reloadEdge++} />
+        </Row>
+        <Pad
+          label="Bắn"
+          big
+          onDown={() => {
+            bus.fireTouch = true;
+            bus.fireEdge++;
+          }}
+          onUp={() => (bus.fireTouch = false)}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Row({ children }: { children: ReactNode }) {
+  return <div className="flex gap-2">{children}</div>;
+}
+
+function Pad({
+  label,
+  onDown,
+  onUp,
+  big,
+}: {
+  label: string;
+  onDown: () => void;
+  onUp?: () => void;
+  big?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      data-ui
+      className={`rounded-full border border-line bg-surface/90 font-display text-fg ${big ? "h-20 w-20 text-base" : "h-12 min-w-12 px-3 text-sm"}`}
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        onDown();
+      }}
+      onPointerUp={(e) => {
+        onUp?.();
+        e.stopPropagation();
+      }}
+      onPointerCancel={() => onUp?.()}
+    >
+      {label}
+    </button>
+  );
+}
+
+function Stick() {
+  const origin = useRef({ x: 0, y: 0, on: false });
+  const move = (e: PE<HTMLDivElement>) => {
+    if (!origin.current.on) return;
+    const dx = e.clientX - origin.current.x;
+    const dy = e.clientY - origin.current.y;
+    const m = Math.hypot(dx, dy) || 1;
+    const k = Math.min(1, m / 52);
+    bus.stick = true;
+    bus.axTouch = (dx / m) * k;
+    bus.azTouch = (-dy / m) * k;
+  };
+  return (
+    <div
+      data-ui
+      className="absolute bottom-6 left-6 z-10 h-32 w-32 rounded-full border border-line bg-surface/70"
+      onPointerDown={(e) => {
+        origin.current.on = true;
+        origin.current.x = e.clientX;
+        origin.current.y = e.clientY;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        e.stopPropagation();
+        move(e);
+      }}
+      onPointerMove={move}
+      onPointerUp={() => {
+        origin.current.on = false;
+        bus.stick = false;
+        bus.axTouch = 0;
+        bus.azTouch = 0;
+      }}
+      onPointerCancel={() => {
+        origin.current.on = false;
+        bus.stick = false;
+        bus.axTouch = 0;
+        bus.azTouch = 0;
+      }}
+    />
+  );
+}
+
+function LookZone() {
+  const st = useRef({ x: 0, y: 0, on: false });
+  return (
+    <div
+      data-ui
+      className="absolute inset-0"
+      onPointerDown={(e) => {
+        if ((e.target as HTMLElement).closest("button, [data-stick]")) return;
+        st.current.on = true;
+        st.current.x = e.clientX;
+        st.current.y = e.clientY;
+        e.currentTarget.setPointerCapture(e.pointerId);
+      }}
+      onPointerMove={(e) => {
+        if (!st.current.on) return;
+        bus.lookDx += e.clientX - st.current.x;
+        bus.lookDy += e.clientY - st.current.y;
+        st.current.x = e.clientX;
+        st.current.y = e.clientY;
+      }}
+      onPointerUp={() => {
+        st.current.on = false;
+      }}
+    />
+  );
+}
+
+export const bus = {
+  keys: new Set<string>(),
+  probe: null as Set<string> | null,
+  lookDx: 0,
+  lookDy: 0,
+  axTouch: 0,
+  azTouch: 0,
+  stick: false,
+  fireTouch: false,
+  jumpTouch: false,
+  reloadTouch: false,
+  swapTouch: false,
+  meleeTouch: false,
+  adsTouch: false,
+  fireEdge: 0,
+  reloadEdge: 0,
+  swapEdge: 0,
+  meleeEdge: 0,
+  jumpEdge: 0,
+};
+
+export function activeKeys(): Set<string> {
+  return bus.probe ?? bus.keys;
+}
+
+export function consumeEdges() {
+  const e = {
+    fire: bus.fireEdge,
+    reload: bus.reloadEdge,
+    swap: bus.swapEdge,
+    melee: bus.meleeEdge,
+    jump: bus.jumpEdge,
+  };
+  bus.fireEdge = 0;
+  bus.reloadEdge = 0;
+  bus.swapEdge = 0;
+  bus.meleeEdge = 0;
+  bus.jumpEdge = 0;
+  return e;
+}
+
+import { DYES, WEAPONS, type WeaponDef } from "./content";
+
+export interface Profile {
+  v: 1;
+  name: string;
+  keys: number;
+  streak: number;
+  bestStreak: number;
+  wins: number;
+  losses: number;
+  elims: number;
+  unlocked: string[];
+  dyes: string[];
+  dye: string;
+  loadout: [string, string];
+  contractsDate: string;
+  prog: { elims: number; wins: number; rounds: number };
+  claimed: { elims: boolean; wins: boolean; rounds: boolean };
+  sens: number;
+  volume: number;
+}
+
+export const CONTRACTS = [
+  { id: "elims" as const, name: "Hạ 12 mạng", goal: 12, reward: 8 },
+  { id: "wins" as const, name: "Thắng 2 trận", goal: 2, reward: 12 },
+  { id: "rounds" as const, name: "Đánh 6 hiệp", goal: 6, reward: 6 },
+];
+
+const KEY = "duelforge-profile-v1";
+
+export function todayKey(d = new Date()): string {
+  return d.toISOString().slice(0, 10);
+}
+
+export function defaultProfile(): Profile {
+  return {
+    v: 1,
+    name: "Khách",
+    keys: 30,
+    streak: 0,
+    bestStreak: 0,
+    wins: 0,
+    losses: 0,
+    elims: 0,
+    unlocked: ["rifle", "sidearm", "blade"],
+    dyes: ["ember", "tide"],
+    dye: "ember",
+    loadout: ["rifle", "sidearm"],
+    contractsDate: todayKey(),
+    prog: { elims: 0, wins: 0, rounds: 0 },
+    claimed: { elims: false, wins: false, rounds: false },
+    sens: 1,
+    volume: 0.8,
+  };
+}
+
+function rollContracts(p: Profile): Profile {
+  const day = todayKey();
+  if (p.contractsDate === day) return p;
+  return {
+    ...p,
+    contractsDate: day,
+    prog: { elims: 0, wins: 0, rounds: 0 },
+    claimed: { elims: false, wins: false, rounds: false },
+  };
+}
+
+export function loadProfile(): Profile {
+  if (typeof window === "undefined") return defaultProfile();
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return defaultProfile();
+    const parsed = JSON.parse(raw) as Partial<Profile>;
+    const base = { ...defaultProfile(), ...parsed, v: 1 as const };
+    if (!Array.isArray(base.unlocked)) base.unlocked = defaultProfile().unlocked;
+    if (!Array.isArray(base.loadout) || base.loadout.length !== 2) {
+      base.loadout = ["rifle", "sidearm"];
+    }
+    return rollContracts(base);
+  } catch {
+    return defaultProfile();
+  }
+}
+
+export function saveProfile(p: Profile) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(KEY, JSON.stringify(p));
+}
+
+export function dyeHex(p: Profile): string {
+  return DYES.find((d) => d.id === p.dye)?.hex ?? "#e23b3b";
+}
+
+export function unlockWeapon(p: Profile, w: WeaponDef): Profile | null {
+  if (p.unlocked.includes(w.id)) return p;
+  if (p.keys < w.cost) return null;
+  return { ...p, keys: p.keys - w.cost, unlocked: [...p.unlocked, w.id] };
+}
+
+export function unlockDye(p: Profile, id: string): Profile | null {
+  const dye = DYES.find((d) => d.id === id);
+  if (!dye) return null;
+  if (p.dyes.includes(id)) return { ...p, dye: id };
+  if (p.keys < dye.cost) return null;
+  return { ...p, keys: p.keys - dye.cost, dyes: [...p.dyes, id], dye: id };
+}
+
+export function claimContract(p: Profile, id: "elims" | "wins" | "rounds"): Profile {
+  const spec = CONTRACTS.find((c) => c.id === id);
+  if (!spec || p.claimed[id] || p.prog[id] < spec.goal) return p;
+  return {
+    ...p,
+    keys: p.keys + spec.reward,
+    claimed: { ...p.claimed, [id]: true },
+  };
+}
+
+export function applyMatchResult(
+  p: Profile,
+  result: { won: boolean; kills: number; rounds: number },
+): { profile: Profile; gained: number } {
+  const next = rollContracts({ ...p });
+  let gained = result.won ? 14 : 5;
+  gained += Math.min(8, result.kills);
+  const streak = result.won ? next.streak + 1 : 0;
+  if (result.won) gained += Math.min(6, streak);
+  next.streak = streak;
+  next.bestStreak = Math.max(next.bestStreak, streak);
+  next.wins += result.won ? 1 : 0;
+  next.losses += result.won ? 0 : 1;
+  next.elims += result.kills;
+  next.keys += gained;
+  next.prog = {
+    elims: next.prog.elims + result.kills,
+    wins: next.prog.wins + (result.won ? 1 : 0),
+    rounds: next.prog.rounds + result.rounds,
+  };
+  return { profile: next, gained };
+}
+
+export function weaponOwned(p: Profile, id: string): boolean {
+  return p.unlocked.includes(id) || WEAPONS.find((w) => w.id === id)?.cost === 0;
+}
+
+import * as THREE from "three";
+import { mapById, type ArenaMap } from "./content";
+import type { Phase } from "./sim";
+
+export interface Actor {
+  id: string;
+  name: string;
+  color: string;
+  team: 0 | 1;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  alive: boolean;
+  crouch: boolean;
+  hitFlash: number;
+  invuln: number;
+}
+
+export interface CamPose {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  recoil: number;
+  speed: number;
+  ads: boolean;
+  weaponId: string;
+  alive: boolean;
+}
+
+export interface RenderFrame {
+  actors: Actor[];
+  localId: string;
+  cam: CamPose;
+  projs: { x: number; y: number; z: number; kind: "grenade" | "rocket" }[];
+  phase: Phase;
+}
+
+interface ActorMesh {
+  group: THREE.Group;
+  body: THREE.MeshStandardMaterial;
+  label: THREE.Sprite;
+}
+
+export class WorldView {
+  renderer: THREE.WebGLRenderer;
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(78, 1, 0.08, 180);
+  viewScene = new THREE.Scene();
+  viewCam = new THREE.PerspectiveCamera(78, 1, 0.05, 12);
+  private actors = new Map<string, ActorMesh>();
+  private guns = new Map<string, THREE.Group>();
+  private gunRoot = new THREE.Group();
+  private tracers: { line: THREE.Line; life: number }[] = [];
+  private booms: { mesh: THREE.Mesh; life: number; max: number }[] = [];
+  private projPool: THREE.Mesh[] = [];
+  private bob = 0;
+  private kick = 0;
+  private mapId = "";
+  private clock = 0;
+  alive = true;
+
+  constructor(canvas: HTMLCanvasElement) {
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.setClearColor(0x1a2030);
+    this.renderer.autoClear = false;
+    this.scene.fog = new THREE.Fog(0x1a2030, 22, 78);
+    this.scene.add(new THREE.HemisphereLight(0xe7eef8, 0x2a241c, 0.85));
+    const sun = new THREE.DirectionalLight(0xfff1d6, 1.45);
+    sun.position.set(14, 26, 10);
+    this.scene.add(sun);
+    const fill = new THREE.DirectionalLight(0x8eb6ff, 0.38);
+    fill.position.set(-12, 8, -8);
+    this.scene.add(fill);
+    this.viewScene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const vdir = new THREE.DirectionalLight(0xffffff, 1.1);
+    vdir.position.set(1, 2, 1);
+    this.viewScene.add(vdir);
+    this.gunRoot.position.set(0.3, -0.3, -0.5);
+    this.viewScene.add(this.gunRoot);
+    for (const id of ["rifle", "sidearm", "blade", "scatter", "stinger", "drum", "triline", "pop", "tube", "glassline"]) {
+      const g = buildGun(id);
+      g.visible = false;
+      this.gunRoot.add(g);
+      this.guns.set(id, g);
+    }
+    for (let i = 0; i < 8; i++) {
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.16, 8, 8),
+        new THREE.MeshStandardMaterial({ color: 0xf0b429, roughness: 0.4 }),
+      );
+      mesh.visible = false;
+      this.scene.add(mesh);
+      this.projPool.push(mesh);
+    }
+  }
+
+  setMap(id: string) {
+    if (this.mapId === id) return;
+    this.mapId = id;
+    const keep: THREE.Object3D[] = [];
+    for (const child of [...this.scene.children]) {
+      if (child.userData.arena) this.scene.remove(child);
+      else keep.push(child);
+    }
+    const map = mapById(id);
+    this.renderer.setClearColor(map.sky);
+    (this.scene.fog as THREE.Fog).color.set(map.sky);
+    this.scene.background = new THREE.Color(map.sky);
+    const mats = new Map<number, THREE.MeshStandardMaterial>();
+    for (const b of map.boxes) {
+      let mat = mats.get(b.color);
+      if (!mat) {
+        mat = new THREE.MeshStandardMaterial({
+          color: b.color,
+          roughness: 0.82,
+          metalness: 0.04,
+        });
+        mats.set(b.color, mat);
+      }
+      const w = b.maxX - b.minX;
+      const h = b.maxY - b.minY;
+      const d = b.maxZ - b.minZ;
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+      mesh.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, (b.minZ + b.maxZ) / 2);
+      mesh.userData.arena = true;
+      this.scene.add(mesh);
+    }
+    void keep;
+    void (null as ArenaMap | null);
+  }
+
+  resize(w: number, h: number) {
+    const pr = Math.min(window.devicePixelRatio || 1, 1.6);
+    this.renderer.setPixelRatio(pr);
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / Math.max(1, h);
+    this.camera.updateProjectionMatrix();
+    this.viewCam.aspect = this.camera.aspect;
+    this.viewCam.updateProjectionMatrix();
+  }
+
+  tracer(x: number, y: number, z: number, x2: number, y2: number, z2: number, color: number) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array([x, y, z, x2, y2, z2]), 3));
+    const line = new THREE.Line(
+      geo,
+      new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 }),
+    );
+    this.scene.add(line);
+    this.tracers.push({ line, life: 0.07 });
+  }
+
+  boom(x: number, y: number, z: number) {
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.4, 10, 8),
+      new THREE.MeshBasicMaterial({ color: 0xf0b429, transparent: true, opacity: 0.85 }),
+    );
+    mesh.position.set(x, y, z);
+    this.scene.add(mesh);
+    this.booms.push({ mesh, life: 0.32, max: 0.32 });
+  }
+
+  kickGun() {
+    this.kick = 1;
+  }
+
+  frame(dt: number, fr: RenderFrame) {
+    this.clock += dt;
+    const targetFov = fr.cam.ads ? 48 : 78;
+    this.camera.fov += (targetFov - this.camera.fov) * Math.min(1, dt * 10);
+    this.camera.updateProjectionMatrix();
+    this.viewCam.fov = this.camera.fov;
+    this.viewCam.updateProjectionMatrix();
+
+    this.camera.position.set(fr.cam.x, fr.cam.y, fr.cam.z);
+    this.camera.rotation.order = "YXZ";
+    this.camera.rotation.y = fr.cam.yaw;
+    this.camera.rotation.x = fr.cam.pitch + fr.cam.recoil;
+    this.camera.rotation.z = 0;
+
+    const seen = new Set<string>();
+    for (const a of fr.actors) {
+      if (a.id === fr.localId && a.alive) continue;
+      seen.add(a.id);
+      let mesh = this.actors.get(a.id);
+      if (!mesh) {
+        mesh = makeActor(a.color, a.name);
+        this.actors.set(a.id, mesh);
+        this.scene.add(mesh.group);
+      }
+      const stand = a.crouch ? 0.62 : 1;
+      mesh.group.position.set(a.x, a.y + (a.alive ? 0 : 0.35), a.z);
+      mesh.group.rotation.set(a.alive ? 0 : Math.PI / 2.3, a.yaw + Math.PI, 0);
+      mesh.group.scale.set(1, a.alive ? stand : 1, 1);
+      const flash = a.hitFlash > 0 ? 0.85 : a.invuln > 0 ? 0.25 + Math.sin(this.clock * 18) * 0.15 : 0;
+      mesh.body.emissive.setHex(a.hitFlash > 0 ? 0xfff2ea : 0x000000);
+      mesh.body.emissiveIntensity = flash;
+      mesh.label.position.y = a.alive ? 2.05 * stand : 0.4;
+      mesh.group.visible = true;
+    }
+    for (const [id, mesh] of this.actors) {
+      if (!seen.has(id)) mesh.group.visible = false;
+    }
+
+    for (let i = 0; i < this.projPool.length; i++) {
+      const p = fr.projs[i];
+      const mesh = this.projPool[i];
+      if (!p) {
+        mesh.visible = false;
+        continue;
+      }
+      mesh.visible = true;
+      mesh.position.set(p.x, p.y, p.z);
+      mesh.scale.setScalar(p.kind === "rocket" ? 0.85 : 1.15);
+    }
+
+    for (let i = this.tracers.length - 1; i >= 0; i--) {
+      const t = this.tracers[i];
+      t.life -= dt;
+      if (t.life <= 0) {
+        this.scene.remove(t.line);
+        t.line.geometry.dispose();
+        (t.line.material as THREE.Material).dispose();
+        this.tracers.splice(i, 1);
+      }
+    }
+    for (let i = this.booms.length - 1; i >= 0; i--) {
+      const b = this.booms[i];
+      b.life -= dt;
+      const k = 1 - b.life / b.max;
+      b.mesh.scale.setScalar(1 + k * 7);
+      (b.mesh.material as THREE.MeshBasicMaterial).opacity = Math.max(0, 1 - k);
+      if (b.life <= 0) {
+        this.scene.remove(b.mesh);
+        b.mesh.geometry.dispose();
+        (b.mesh.material as THREE.Material).dispose();
+        this.booms.splice(i, 1);
+      }
+    }
+
+    this.bob += dt * (2.2 + fr.cam.speed * 1.3);
+    const moving = fr.cam.speed > 0.6 && fr.cam.alive ? 1 : 0;
+    this.kick = Math.max(0, this.kick - dt * 8);
+    this.gunRoot.position.x = 0.3 + Math.cos(this.bob * 0.5) * 0.012 * moving;
+    this.gunRoot.position.y = -0.3 + Math.sin(this.bob) * 0.016 * moving - (fr.cam.ads ? 0.06 : 0);
+    this.gunRoot.position.z = -0.5 + this.kick * 0.08;
+    this.gunRoot.rotation.x = this.kick * 0.15;
+    this.gunRoot.visible = fr.cam.alive && fr.phase !== "end";
+    for (const [id, g] of this.guns) g.visible = id === fr.cam.weaponId;
+
+    this.renderer.clear();
+    this.renderer.render(this.scene, this.camera);
+    if (this.gunRoot.visible) {
+      this.renderer.clearDepth();
+      this.renderer.render(this.viewScene, this.viewCam);
+    }
+  }
+
+  dispose() {
+    this.alive = false;
+    this.renderer.dispose();
+  }
+}
+
+function makeActor(hex: string, name: string): ActorMesh {
+  const group = new THREE.Group();
+  const color = new THREE.Color(hex);
+  const body = new THREE.MeshStandardMaterial({
+    color,
+    roughness: 0.58,
+    metalness: 0.06,
+    emissive: 0x000000,
+  });
+  const limb = new THREE.MeshStandardMaterial({
+    color: color.clone().multiplyScalar(0.72),
+    roughness: 0.7,
+  });
+  const visor = new THREE.MeshStandardMaterial({
+    color: 0xf3ecdf,
+    emissive: 0xf0b429,
+    emissiveIntensity: 0.45,
+    roughness: 0.25,
+  });
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.46, 0.48), body);
+  head.position.y = 1.5;
+  const vis = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.1, 0.08), visor);
+  vis.position.set(0, 1.52, 0.24);
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.78, 0.4), body);
+  torso.position.y = 0.92;
+  const armL = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.62, 0.18), limb);
+  armL.position.set(-0.48, 0.92, 0);
+  const armR = armL.clone();
+  armR.position.x = 0.48;
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.62, 0.24), limb);
+  legL.position.set(-0.18, 0.31, 0);
+  const legR = legL.clone();
+  legR.position.x = 0.18;
+  group.add(head, vis, torso, armL, armR, legL, legR);
+  const label = makeLabel(name);
+  label.position.y = 2.05;
+  group.add(label);
+  return { group, body, label };
+}
+
+function makeLabel(text: string): THREE.Sprite {
+  const c = document.createElement("canvas");
+  c.width = 256;
+  c.height = 64;
+  const g = c.getContext("2d");
+  if (g) {
+    g.clearRect(0, 0, 256, 64);
+    g.font = "600 34px Outfit, sans-serif";
+    g.fillStyle = "#f3ecdf";
+    g.textAlign = "center";
+    g.fillText(text.slice(0, 14), 128, 42);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: true });
+  const s = new THREE.Sprite(mat);
+  s.scale.set(1.5, 0.38, 1);
+  return s;
+}
+
+function buildGun(id: string): THREE.Group {
+  const g = new THREE.Group();
+  const steel = new THREE.MeshStandardMaterial({ color: 0x2c3138, roughness: 0.45, metalness: 0.35 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x1a1d22, roughness: 0.5, metalness: 0.2 });
+  const accent = new THREE.MeshStandardMaterial({ color: 0xf0b429, roughness: 0.4, metalness: 0.2 });
+  const wood = new THREE.MeshStandardMaterial({ color: 0x6e4528, roughness: 0.75 });
+  const box = (w: number, h: number, d: number, x: number, y: number, z: number, m: THREE.Material) => {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+    mesh.position.set(x, y, z);
+    g.add(mesh);
+  };
+  if (id === "blade") {
+    box(0.06, 0.08, 0.55, 0, 0, -0.25, steel);
+    box(0.04, 0.16, 0.12, 0, -0.06, 0.05, wood);
+    box(0.09, 0.03, 0.12, 0, 0.04, -0.02, accent);
+    return g;
+  }
+  if (id === "scatter") {
+    box(0.1, 0.1, 0.28, 0, 0, -0.05, wood);
+    box(0.07, 0.07, 0.42, 0.04, 0.02, -0.38, steel);
+    box(0.07, 0.07, 0.42, -0.04, 0.02, -0.38, steel);
+    return g;
+  }
+  if (id === "glassline") {
+    box(0.07, 0.08, 0.7, 0, 0.02, -0.3, dark);
+    box(0.05, 0.08, 0.16, 0, 0.12, -0.15, steel);
+    box(0.08, 0.14, 0.08, 0, -0.08, 0.02, wood);
+    box(0.03, 0.03, 0.2, 0, 0.04, -0.7, accent);
+    return g;
+  }
+  if (id === "tube") {
+    box(0.12, 0.12, 0.55, 0, 0.02, -0.25, dark);
+    box(0.16, 0.08, 0.16, 0, -0.02, -0.55, accent);
+    box(0.06, 0.16, 0.08, 0, -0.1, 0.02, steel);
+    return g;
+  }
+  if (id === "pop") {
+    box(0.1, 0.1, 0.12, 0, 0, -0.05, accent);
+    box(0.04, 0.12, 0.04, 0, -0.08, 0.02, steel);
+    return g;
+  }
+  if (id === "drum") {
+    box(0.08, 0.1, 0.22, 0, 0, -0.12, steel);
+    box(0.1, 0.1, 0.1, 0, -0.02, -0.02, dark);
+    box(0.03, 0.03, 0.2, 0, 0.02, -0.32, accent);
+    return g;
+  }
+  if (id === "sidearm") {
+    box(0.06, 0.1, 0.2, 0, 0, -0.08, steel);
+    box(0.05, 0.12, 0.06, 0, -0.08, 0.0, dark);
+    return g;
+  }
+  box(0.08, 0.1, 0.46, 0, 0, -0.16, id === "stinger" ? dark : steel);
+  box(0.045, 0.045, 0.36, 0, 0.02, -0.5, dark);
+  box(0.06, 0.16, 0.08, 0, -0.12, -0.08, dark);
+  box(0.07, 0.08, 0.12, 0, 0.02, 0.12, wood);
+  if (id === "triline") box(0.09, 0.03, 0.2, 0, 0.08, -0.2, accent);
+  return g;
+}
+
+import { mapById, solidBoxes, weapon, type MatchConfig } from "./content";
+import { activeKeys, bus, consumeEdges } from "./input";
+import { WorldView, type Actor } from "./render";
+import {
+  Match,
+  clamp,
+  moveBody,
+  wrap,
+  type Body,
+  type Fx,
+  type InputState,
+  type NetSnap,
+  type Phase,
+} from "./sim";
+import { playBeep, playBoom, playEmpty, playHit, playHurt, playKill, playShot, playStep } from "./audio";
+
+export interface FeedLine {
+  id: number;
+  text: string;
+  mine: boolean;
+}
+
+export interface HudModel {
+  hp: number;
+  maxHp: number;
+  mag: number;
+  reserve: number;
+  weaponName: string;
+  slot: number;
+  scores: [number, number];
+  myTeam: 0 | 1;
+  phase: Phase;
+  phaseT: number;
+  fightTime: number;
+  round: number;
+  feed: FeedLine[];
+  hit: number;
+  head: boolean;
+  hurt: number;
+  heat: number;
+  ads: boolean;
+  alive: boolean;
+  winner: 0 | 1 | null;
+  gapTeam: 0 | 1 | null;
+  ended: boolean;
+  reloading: boolean;
+  kills: number;
+}
+
+export interface NetHandle {
+  broadcast: (data: unknown) => void;
+  send: (data: unknown, peerId?: string) => void;
+  onMessage: (fn: (from: string, data: unknown, channel: "state" | "reliable") => void) => () => void;
+  selfId: string;
+}
+
+export interface SessionOpts {
+  canvas: HTMLCanvasElement;
+  cfg: MatchConfig;
+  isHost: boolean;
+  hostId: string;
+  net: NetHandle | null;
+  sens: number;
+  getPaused: () => boolean;
+  onHud: (h: HudModel) => void;
+  onEscape: () => void;
+}
+
+const WATCH = new Set([
+  "KeyW",
+  "KeyA",
+  "KeyS",
+  "KeyD",
+  "Space",
+  "ShiftLeft",
+  "ShiftRight",
+  "KeyR",
+  "KeyQ",
+  "KeyF",
+  "KeyC",
+  "ControlLeft",
+  "Digit1",
+  "Digit2",
+]);
+
+export function startSession(opts: SessionOpts): () => void {
+  const { canvas, cfg } = opts;
+  const selfId = cfg.selfId;
+  const qa =
+    typeof window !== "undefined" && new URLSearchParams(window.location.search).has("qa");
+  const view = new WorldView(canvas);
+  view.setMap(cfg.mapId);
+  const map = mapById(cfg.mapId);
+  const boxes = solidBoxes(map);
+  const gravity = cfg.mod === "moon" ? 11 : 26;
+  const match = opts.isHost ? new Match(cfg, qa && !opts.net) : null;
+  const meSlot = cfg.slots.find((s) => s.id === selfId) ?? cfg.slots[0];
+  const spawnList = map.spawns[meSlot.team];
+  const spawnIndex = cfg.slots.filter((s) => s.team === meSlot.team).findIndex((s) => s.id === selfId);
+  const spawn = spawnList[Math.max(0, spawnIndex) % spawnList.length];
+  let yaw = Math.atan2(-(0 - spawn.x), -(0 - spawn.z));
+  let pitch = 0;
+  const ghost: Body = {
+    x: spawn.x,
+    y: 0.02,
+    z: spawn.z,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    yaw,
+    pitch: 0,
+    grounded: true,
+    crouch: false,
+    ax: 0,
+    az: 0,
+    sprint: false,
+    jump: false,
+    height: 1.72,
+  };
+  let snap: NetSnap | null = null;
+  let fireSeq = 0;
+  let reloadSeq = 0;
+  let swapSeq = 0;
+  let meleeSeq = 0;
+  let jumpLatch = 0;
+  let mouseDown = false;
+  let rmb = false;
+  let lastSnap = 0;
+  let lastSend = 0;
+  let hudAcc = 0;
+  let stepAcc = 0;
+  let foot = 0;
+  let hit = 0;
+  let head = false;
+  let hurt = 0;
+  let recoil = 0;
+  let feed: FeedLine[] = [];
+  let feedN = 1;
+  let lastFxTick = -1;
+  const pending: Fx[] = [];
+  const remoteInputs = new Map<string, InputState>();
+  const smoothed = new Map<string, Actor>();
+  let localSlot = 0;
+  let lastCount = 99;
+  let announcedFight = false;
+  let raf = 0;
+  let last = performance.now();
+  let stopped = false;
+
+  const resize = () => {
+    const r = canvas.getBoundingClientRect();
+    view.resize(Math.max(1, r.width), Math.max(1, r.height));
+  };
+  resize();
+  const ro = new ResizeObserver(resize);
+  ro.observe(canvas);
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.code === "Escape") {
+      e.preventDefault();
+      document.exitPointerLock?.();
+      opts.onEscape();
+      return;
+    }
+    if ((e.target as HTMLElement | null)?.closest?.("input, textarea")) return;
+    if (WATCH.has(e.code)) e.preventDefault();
+    if (e.repeat) return;
+    bus.keys.add(e.code);
+    if (e.code === "KeyR") bus.reloadEdge++;
+    if (e.code === "KeyQ") bus.swapEdge++;
+    if (e.code === "KeyF") bus.meleeEdge++;
+    if (e.code === "Space") bus.jumpEdge++;
+    if (e.code === "Digit1" && localSlot !== 0) bus.swapEdge++;
+    if (e.code === "Digit2" && localSlot !== 1) bus.swapEdge++;
+  };
+  const onKeyUp = (e: KeyboardEvent) => {
+    bus.keys.delete(e.code);
+  };
+  const onBlur = () => {
+    bus.keys.clear();
+    mouseDown = false;
+    rmb = false;
+  };
+  const onDown = (e: MouseEvent) => {
+    if ((e.target as HTMLElement | null)?.closest?.("[data-ui]")) return;
+    if (e.button === 0) {
+      mouseDown = true;
+      bus.fireEdge++;
+      const lock = canvas.requestPointerLock;
+      if (lock) {
+        try {
+          const ret = lock.call(canvas, { unadjustedMovement: true }) as unknown as Promise<void> | void;
+          if (ret && typeof (ret as Promise<void>).catch === "function") {
+            (ret as Promise<void>).catch(() => {
+              try {
+                canvas.requestPointerLock();
+              } catch {
+                /* drag-look fallback */
+              }
+            });
+          }
+        } catch {
+          try {
+            canvas.requestPointerLock();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+    if (e.button === 2) rmb = true;
+  };
+  const onUp = (e: MouseEvent) => {
+    if (e.button === 0) mouseDown = false;
+    if (e.button === 2) rmb = false;
+  };
+  const onMove = (e: MouseEvent) => {
+    if (document.pointerLockElement === canvas || e.buttons) {
+      bus.lookDx += e.movementX;
+      bus.lookDy += e.movementY;
+    }
+  };
+  const onContext = (e: Event) => e.preventDefault();
+
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
+  window.addEventListener("blur", onBlur);
+  window.addEventListener("mouseup", onUp);
+  window.addEventListener("mousemove", onMove);
+  canvas.addEventListener("mousedown", onDown);
+  canvas.addEventListener("contextmenu", onContext);
+
+  const unsub =
+    opts.net?.onMessage((_from, data) => {
+      if (!data || typeof data !== "object") return;
+      const msg = data as { k?: string; id?: string; inp?: InputState; snap?: NetSnap };
+      if (msg.k === "inp" && msg.inp && msg.id && opts.isHost) remoteInputs.set(msg.id, msg.inp);
+      if (msg.k === "snap" && msg.snap && !opts.isHost) snap = msg.snap;
+    }) ?? (() => {});
+
+  const pushFeed = (text: string, mine: boolean) => {
+    feed = [{ id: feedN++, text, mine }, ...feed].slice(0, 5);
+  };
+
+  const handleFx = (list: Fx[], fromSelfShots: boolean) => {
+    for (const fx of list) {
+      if (fx.kind === "tracer") {
+        const shooter = teamOf(fx.owner);
+        view.tracer(fx.x, fx.y, fx.z, fx.x2 ?? fx.x, fx.y2 ?? fx.y, fx.z2 ?? fx.z, shooter === 1 ? 0x7eb0ff : 0xff8d6a);
+        if (fx.owner === selfId) {
+          view.kickGun();
+          const id = currentWeaponId();
+          playShot(id);
+          recoil = Math.min(0.12, recoil + 0.02);
+        }
+      } else if (fx.kind === "boom") {
+        view.boom(fx.x, fx.y, fx.z);
+        playBoom();
+      } else if (fx.kind === "hit") {
+        if (fx.owner === selfId) {
+          hit = 1;
+          head = Boolean(fx.head);
+          playHit(Boolean(fx.head));
+        }
+        if (fx.victim === selfId) {
+          hurt = 1;
+          playHurt();
+        }
+      } else if (fx.kind === "kill") {
+        const mine = fx.owner === selfId || fx.victim === selfId;
+        const a = fx.owner === selfId ? "Bạn" : (fx.ownerName ?? "Ai đó");
+        const b = fx.victim === selfId ? "bạn" : (fx.victimName ?? "đối thủ");
+        pushFeed(`${a} hạ ${b}`, mine);
+        if (fx.owner === selfId) playKill();
+        if (fx.victim === selfId) playHurt();
+      }
+    }
+    void fromSelfShots;
+  };
+
+  const teamOf = (id: string): 0 | 1 => {
+    const s = cfg.slots.find((x) => x.id === id);
+    if (s) return s.team;
+    const f = match?.fighters.find((x) => x.id === id);
+    return f?.team ?? 0;
+  };
+
+  const currentWeaponId = (): string => {
+    if (match) {
+      const f = match.self(selfId);
+      if (f) return f.weapons[f.slot];
+    }
+    if (snap) {
+      const f = snap.fighters.find((x) => x.id === selfId);
+      if (f) return f.weapons[f.slot];
+    }
+    return meSlot.weapons[localSlot] ?? "rifle";
+  };
+
+  const readInput = (): InputState => {
+    const edges = consumeEdges();
+    fireSeq += edges.fire;
+    reloadSeq += edges.reload;
+    swapSeq += edges.swap;
+    if (edges.swap) localSlot = localSlot === 0 ? 1 : 0;
+    meleeSeq += edges.melee;
+    if (edges.jump) jumpLatch = 8;
+    const keys = activeKeys();
+    let ax = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0);
+    let az = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
+    if (bus.stick) {
+      ax = bus.axTouch;
+      az = bus.azTouch;
+    }
+    const ads = (rmb || bus.adsTouch) && weapon(currentWeaponId()).ads === true;
+    const lookSens = 0.00215 * opts.sens * (ads ? 0.58 : 1);
+    yaw -= bus.lookDx * lookSens;
+    pitch -= bus.lookDy * lookSens;
+    pitch = clamp(pitch, -1.45, 1.45);
+    bus.lookDx = 0;
+    bus.lookDy = 0;
+    yaw = wrap(yaw);
+    const jump = jumpLatch > 0;
+    if (jumpLatch > 0) jumpLatch--;
+    const fireHeld = mouseDown || bus.fireTouch;
+    if (fireHeld && weapon(currentWeaponId()).kind !== "hitscan") {
+      /* proj + melee use edges already counted via fireEdge on press */
+    }
+    return {
+      seq: fireSeq,
+      yaw,
+      pitch,
+      ax,
+      az,
+      sprint: keys.has("ShiftLeft") || keys.has("ShiftRight") || (bus.stick && az > 0.82),
+      crouch: keys.has("KeyC") || keys.has("ControlLeft"),
+      fire: fireHeld,
+      fireSeq,
+      reloadSeq,
+      swapSeq,
+      meleeSeq,
+      jump,
+      ads,
+    };
+  };
+
+  const publishHud = (force = false) => {
+    const fMatch = match?.self(selfId);
+    const fSnap = snap?.fighters.find((x) => x.id === selfId);
+    const phase = match?.phase ?? snap?.phase ?? "count";
+    const phaseT = match?.phaseT ?? snap?.phaseT ?? 3;
+    const fightTime = match?.fightTime ?? snap?.fightTime ?? 0;
+    const scores = match?.scores ?? snap?.scores ?? [0, 0];
+    const alive = fMatch?.alive ?? fSnap?.alive ?? true;
+    const wid = currentWeaponId();
+    const w = weapon(wid);
+    const mag = fMatch ? fMatch.mags[fMatch.slot] : (fSnap?.mag ?? w.mag);
+    const reserve = fMatch ? fMatch.reserves[fMatch.slot] : (fSnap?.reserve ?? w.reserve);
+    const reloading = (fMatch?.reload ?? fSnap?.reload ?? 0) > 0;
+    const hp = Math.max(0, fMatch?.hp ?? fSnap?.hp ?? 100);
+    const hud: HudModel = {
+      hp,
+      maxHp: match?.hpMax ?? 100,
+      mag: w.kind === "melee" ? 0 : mag,
+      reserve: w.kind === "melee" ? 0 : reserve,
+      weaponName: w.name,
+      slot: fMatch?.slot ?? fSnap?.slot ?? localSlot,
+      scores,
+      myTeam: meSlot.team,
+      phase,
+      phaseT,
+      fightTime,
+      round: match?.round ?? snap?.round ?? 1,
+      feed,
+      hit,
+      head,
+      hurt,
+      heat: fMatch?.heat ?? fSnap?.heat ?? 0,
+      ads: fMatch?.ads ?? rmb,
+      alive,
+      winner: match?.winner ?? snap?.winner ?? null,
+      gapTeam: match?.gapTeam ?? snap?.gapTeam ?? null,
+      ended: phase === "end",
+      reloading,
+      kills: fMatch?.kills ?? fSnap?.kills ?? 0,
+    };
+    if (phase === "count") {
+      const c = Math.ceil(phaseT);
+      if (c !== lastCount && c > 0 && c <= 3) {
+        lastCount = c;
+        playBeep(false);
+      }
+    } else if (phase === "fight" && !announcedFight) {
+      announcedFight = true;
+      playBeep(true);
+    }
+    if (phase !== "fight") announcedFight = phase === "count" ? announcedFight : false;
+    if (phase === "count") announcedFight = false;
+    if (force || true) opts.onHud(hud);
+    hit *= 0.82;
+    hurt *= 0.86;
+  };
+
+  const loop = (now: number) => {
+    if (stopped) return;
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    const input = readInput();
+    const paused = opts.getPaused();
+
+    if (match && !paused) {
+      match.applyInput(selfId, input);
+      for (const [id, inp] of remoteInputs) match.applyInput(id, inp);
+      const fx = match.step(dt);
+      pending.push(...fx);
+      handleFx(fx, true);
+      const me = match.self(selfId);
+      if (me) {
+        ghost.x = me.x;
+        ghost.y = me.y;
+        ghost.z = me.z;
+        ghost.vx = me.vx;
+        ghost.vz = me.vz;
+        recoil = me.recoil;
+        yaw = me.yaw;
+        pitch = me.pitch;
+      }
+    } else if (!match && !paused) {
+      ghost.yaw = yaw;
+      ghost.pitch = pitch;
+      ghost.ax = input.ax;
+      ghost.az = input.az;
+      ghost.sprint = input.sprint;
+      ghost.crouch = input.crouch;
+      ghost.jump = input.jump;
+      const phase = snap?.phase ?? "count";
+      const me = snap?.fighters.find((f) => f.id === selfId);
+      const alive = me?.alive !== false;
+      if (phase === "fight" && alive) moveBody(ghost, dt, boxes, gravity);
+      if (me) {
+        if (!alive || phase !== "fight") {
+          ghost.x = me.x;
+          ghost.y = me.y;
+          ghost.z = me.z;
+          ghost.vx = 0;
+          ghost.vz = 0;
+        } else {
+          const err = Math.hypot(me.x - ghost.x, me.z - ghost.z);
+          if (err > 3.2) {
+            ghost.x = me.x;
+            ghost.y = me.y;
+            ghost.z = me.z;
+            ghost.vx = me.vx;
+            ghost.vz = me.vz;
+          } else {
+            ghost.x += (me.x - ghost.x) * 0.15;
+            ghost.y += (me.y - ghost.y) * 0.25;
+            ghost.z += (me.z - ghost.z) * 0.15;
+          }
+        }
+      }
+      recoil *= Math.exp(-9 * dt);
+      if (snap && snap.tick !== lastFxTick) {
+        lastFxTick = snap.tick;
+        handleFx(snap.fx, false);
+      }
+    }
+
+    if (opts.net && !opts.isHost && now - lastSend > 50) {
+      lastSend = now;
+      opts.net.broadcast({ k: "inp", id: selfId, inp: input });
+    }
+    if (opts.net && opts.isHost && match && now - lastSnap > 50) {
+      lastSnap = now;
+      const packet = match.snapshot();
+      packet.fx = pending.splice(0, 32);
+      opts.net.broadcast({ k: "snap", snap: packet });
+    }
+
+    const speed = Math.hypot(ghost.vx, ghost.vz);
+    const grounded = match?.self(selfId)?.grounded ?? ghost.grounded;
+    if (speed > 2.2 && grounded && (match?.phase ?? snap?.phase) === "fight") {
+      foot -= dt;
+      if (foot <= 0) {
+        foot = speed > 7 ? 0.32 : 0.42;
+        playStep();
+      }
+    }
+
+    const actors: Actor[] = [];
+    if (match) {
+      for (const f of match.fighters) {
+        actors.push({
+          id: f.id,
+          name: f.name,
+          color: f.color,
+          team: f.team,
+          x: f.x,
+          y: f.y,
+          z: f.z,
+          yaw: f.yaw,
+          alive: f.alive,
+          crouch: f.crouch,
+          hitFlash: f.hitFlash,
+          invuln: f.invuln,
+        });
+      }
+    } else if (snap) {
+      for (const f of snap.fighters) {
+        let sm = smoothed.get(f.id);
+        if (!sm) {
+          sm = {
+            id: f.id,
+            name: f.name,
+            color: f.color,
+            team: f.team,
+            x: f.x,
+            y: f.y,
+            z: f.z,
+            yaw: f.yaw,
+            alive: f.alive,
+            crouch: f.crouch,
+            hitFlash: f.hitFlash,
+            invuln: f.invuln,
+          };
+          smoothed.set(f.id, sm);
+        }
+        sm.name = f.name;
+        sm.alive = f.alive;
+        sm.crouch = f.crouch;
+        sm.hitFlash = f.hitFlash;
+        sm.invuln = f.invuln;
+        sm.color = f.color;
+        if (f.id === selfId) {
+          sm.x = ghost.x;
+          sm.y = ghost.y;
+          sm.z = ghost.z;
+          sm.yaw = yaw;
+        } else {
+          sm.x += (f.x - sm.x) * Math.min(1, dt * 14);
+          sm.y += (f.y - sm.y) * Math.min(1, dt * 14);
+          sm.z += (f.z - sm.z) * Math.min(1, dt * 14);
+          sm.yaw += wrap(f.yaw - sm.yaw) * Math.min(1, dt * 14);
+        }
+        actors.push(sm);
+      }
+    } else {
+      for (const s of cfg.slots) {
+        const sp = map.spawns[s.team][0];
+        actors.push({
+          id: s.id,
+          name: s.name,
+          color: s.color,
+          team: s.team,
+          x: s.id === selfId ? ghost.x : sp.x,
+          y: 0,
+          z: s.id === selfId ? ghost.z : sp.z,
+          yaw: s.id === selfId ? yaw : 0,
+          alive: true,
+          crouch: false,
+          hitFlash: 0,
+          invuln: 0,
+        });
+      }
+    }
+
+    const eye = (match?.self(selfId)?.crouch ?? input.crouch) ? 1.05 : 1.52;
+    const alive = match?.self(selfId)?.alive ?? snap?.fighters.find((f) => f.id === selfId)?.alive ?? true;
+    const projs = match
+      ? match.projs.map((p) => ({ x: p.x, y: p.y, z: p.z, kind: p.kind }))
+      : (snap?.projs ?? []);
+    view.frame(dt, {
+      actors,
+      localId: selfId,
+      projs,
+      phase: match?.phase ?? snap?.phase ?? "count",
+      cam: {
+        x: ghost.x,
+        y: ghost.y + eye,
+        z: ghost.z,
+        yaw,
+        pitch,
+        recoil,
+        speed,
+        ads: input.ads,
+        weaponId: alive ? currentWeaponId() : "rifle",
+        alive,
+      },
+    });
+
+    hudAcc += dt;
+    if (hudAcc > 0.08) {
+      hudAcc = 0;
+      publishHud();
+    }
+    stepAcc += dt;
+    raf = requestAnimationFrame(loop);
+  };
+  publishHud(true);
+  raf = requestAnimationFrame(loop);
+
+  const probeOn = import.meta.env.DEV || qa;
+  if (probeOn) {
+    window.__controlsTest = {
+      getYaw: () => yaw,
+      getSpeed: () => Math.hypot(ghost.vx, ghost.vz),
+      getPos: () => ({ x: ghost.x, y: ghost.y, z: ghost.z }),
+      setKeys: (codes: string[]) => {
+        bus.probe = new Set(codes);
+      },
+    };
+  }
+
+  return () => {
+    stopped = true;
+    cancelAnimationFrame(raf);
+    unsub();
+    ro.disconnect();
+    window.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("keyup", onKeyUp);
+    window.removeEventListener("blur", onBlur);
+    window.removeEventListener("mouseup", onUp);
+    window.removeEventListener("mousemove", onMove);
+    canvas.removeEventListener("mousedown", onDown);
+    canvas.removeEventListener("contextmenu", onContext);
+    if (document.pointerLockElement === canvas) document.exitPointerLock?.();
+    bus.probe = null;
+    bus.keys.clear();
+    bus.stick = false;
+    bus.fireTouch = false;
+    if (probeOn) delete window.__controlsTest;
+    view.dispose();
+  };
+}
+
+declare global {
+  interface Window {
+    __controlsTest?: {
+      getYaw: () => number;
+      getSpeed: () => number;
+      getPos: () => { x: number; y: number; z: number };
+      setKeys: (codes: string[]) => void;
+    };
+  }
+}
+
+import {
+  mapById,
+  solidBoxes,
+  weapon,
+  type ArenaMap,
+  type Box,
+  type MatchConfig,
+  type ModId,
+  type WeaponDef,
+} from "./content";
+
+export const STEP = 1 / 60;
+const R = 0.42;
+
+export interface V3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface Body {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  yaw: number;
+  pitch: number;
+  grounded: boolean;
+  crouch: boolean;
+  ax: number;
+  az: number;
+  sprint: boolean;
+  jump: boolean;
+  height: number;
+}
+
+export interface Fighter extends Body {
+  id: string;
+  name: string;
+  team: 0 | 1;
+  bot: boolean;
+  color: string;
+  hp: number;
+  alive: boolean;
+  weapons: [string, string];
+  slot: 0 | 1;
+  mags: [number, number];
+  reserves: [number, number];
+  reload: number;
+  fireCd: number;
+  burstLeft: number;
+  heat: number;
+  kills: number;
+  ads: boolean;
+  fire: boolean;
+  fireSeq: number;
+  seenFire: number;
+  reloadSeq: number;
+  seenReload: number;
+  swapSeq: number;
+  seenSwap: number;
+  meleeSeq: number;
+  seenMelee: number;
+  invuln: number;
+  hitFlash: number;
+  recoil: number;
+  think: number;
+  strafe: number;
+  meleeCd: number;
+}
+
+export interface Proj {
+  id: number;
+  owner: string;
+  team: 0 | 1;
+  kind: "grenade" | "rocket";
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  life: number;
+  dmg: number;
+  radius: number;
+  armed: number;
+}
+
+export type Phase = "count" | "fight" | "gap" | "end";
+
+export interface Fx {
+  kind: "tracer" | "hit" | "kill" | "boom";
+  owner: string;
+  victim?: string;
+  ownerName?: string;
+  victimName?: string;
+  head?: boolean;
+  dmg?: number;
+  x: number;
+  y: number;
+  z: number;
+  x2?: number;
+  y2?: number;
+  z2?: number;
+}
+
+export interface InputState {
+  seq: number;
+  yaw: number;
+  pitch: number;
+  ax: number;
+  az: number;
+  sprint: boolean;
+  crouch: boolean;
+  fire: boolean;
+  fireSeq: number;
+  reloadSeq: number;
+  swapSeq: number;
+  meleeSeq: number;
+  jump: boolean;
+  ads: boolean;
+}
+
+export interface SnapFighter {
+  id: string;
+  name: string;
+  team: 0 | 1;
+  bot: boolean;
+  color: string;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  vx: number;
+  vz: number;
+  hp: number;
+  alive: boolean;
+  slot: 0 | 1;
+  mag: number;
+  reserve: number;
+  weapons: [string, string];
+  kills: number;
+  crouch: boolean;
+  ads: boolean;
+  invuln: number;
+  hitFlash: number;
+  heat: number;
+  reload: number;
+}
+
+export interface NetSnap {
+  k: "snap";
+  tick: number;
+  phase: Phase;
+  phaseT: number;
+  fightTime: number;
+  round: number;
+  scores: [number, number];
+  winner: 0 | 1 | null;
+  gapTeam: 0 | 1 | null;
+  mapId: string;
+  fighters: SnapFighter[];
+  fx: Fx[];
+  projs: { x: number; y: number; z: number; kind: "grenade" | "rocket"; team: 0 | 1 }[];
+}
+
+export function wrap(a: number): number {
+  let x = a;
+  while (x > Math.PI) x -= Math.PI * 2;
+  while (x < -Math.PI) x += Math.PI * 2;
+  return x;
+}
+
+export function clamp(v: number, a: number, b: number): number {
+  return Math.max(a, Math.min(b, v));
+}
+
+function dot(a: V3, b: V3): number {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+function sub(a: V3, b: V3): V3 {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
+function len(a: V3): number {
+  return Math.hypot(a.x, a.y, a.z);
+}
+
+export function forward(yaw: number, pitch: number): V3 {
+  const cp = Math.cos(pitch);
+  return { x: -Math.sin(yaw) * cp, y: Math.sin(pitch), z: -Math.cos(yaw) * cp };
+}
+
+export function flatForward(yaw: number): V3 {
+  return { x: -Math.sin(yaw), y: 0, z: -Math.cos(yaw) };
+}
+
+export function flatRight(yaw: number): V3 {
+  return { x: Math.cos(yaw), y: 0, z: -Math.sin(yaw) };
+}
+
+function overlap(b: Body, h: number, box: Box): boolean {
+  return (
+    b.x + R > box.minX &&
+    b.x - R < box.maxX &&
+    b.z + R > box.minZ &&
+    b.z - R < box.maxZ &&
+    b.y + h > box.minY &&
+    b.y < box.maxY
+  );
+}
+
+function resolve(b: Body, axis: "x" | "y" | "z", h: number, boxes: Box[]): "up" | "down" | "side" | null {
+  let result: "up" | "down" | "side" | null = null;
+  for (let n = 0; n < 4; n++) {
+    let hit = false;
+    for (const box of boxes) {
+      if (!box.solid || !overlap(b, h, box)) continue;
+      hit = true;
+      if (axis === "x") {
+        const penL = b.x + R - box.minX;
+        const penR = box.maxX - (b.x - R);
+        if (penL < penR) b.x -= penL;
+        else b.x += penR;
+        b.vx = 0;
+        result = "side";
+      } else if (axis === "z") {
+        const penL = b.z + R - box.minZ;
+        const penR = box.maxZ - (b.z - R);
+        if (penL < penR) b.z -= penL;
+        else b.z += penR;
+        b.vz = 0;
+        result = "side";
+      } else {
+        const penUp = box.maxY - b.y;
+        const penDown = b.y + h - box.minY;
+        if (penUp < penDown) {
+          b.y += penUp;
+          result = "up";
+        } else {
+          b.y -= penDown;
+          result = "down";
+        }
+      }
+    }
+    if (!hit) break;
+  }
+  return result;
+}
+
+export function moveBody(b: Body, dt: number, boxes: Box[], gravity: number) {
+  const h = b.crouch ? 1.15 : 1.72;
+  b.height = h;
+  const accel = b.grounded ? 46 : 12;
+  const maxSpeed = b.crouch ? 3.5 : b.sprint ? 9.3 : 6.5;
+  let wx = 0;
+  let wz = 0;
+  const wish = Math.hypot(b.ax, b.az);
+  if (wish > 0.01) {
+    const ax = b.ax / wish;
+    const az = b.az / wish;
+    const f = flatForward(b.yaw);
+    const r = flatRight(b.yaw);
+    wx = (r.x * ax + f.x * az) * maxSpeed;
+    wz = (r.z * ax + f.z * az) * maxSpeed;
+  }
+  const k = Math.min(1, accel * dt);
+  b.vx += (wx - b.vx) * k;
+  b.vz += (wz - b.vz) * k;
+  if (b.grounded && wish <= 0.01) {
+    b.vx *= Math.max(0, 1 - 14 * dt);
+    b.vz *= Math.max(0, 1 - 14 * dt);
+  }
+  b.vy -= gravity * dt;
+  if (b.jump && b.grounded) {
+    b.vy = gravity > 20 ? 8.3 : 9.4;
+    b.grounded = false;
+  }
+  b.jump = false;
+
+  b.x += b.vx * dt;
+  resolve(b, "x", h, boxes);
+  b.z += b.vz * dt;
+  resolve(b, "z", h, boxes);
+  b.y += b.vy * dt;
+  const yHit = resolve(b, "y", h, boxes);
+  if (yHit === "up") {
+    b.grounded = true;
+    if (b.vy < 0) b.vy = 0;
+  } else if (yHit === "down") {
+    b.grounded = false;
+    if (b.vy > 0) b.vy = 0;
+  } else {
+    b.grounded = false;
+  }
+  if (b.y < 0) {
+    b.y = 0;
+    b.vy = 0;
+    b.grounded = true;
+  }
+}
+
+export function rayAABB(o: V3, d: V3, box: Box): number | null {
+  let tmin = 0;
+  let tmax = 1e9;
+  const mins = [box.minX, box.minY, box.minZ];
+  const maxs = [box.maxX, box.maxY, box.maxZ];
+  const oc = [o.x, o.y, o.z];
+  const dc = [d.x, d.y, d.z];
+  for (let i = 0; i < 3; i++) {
+    const inv = 1 / (Math.abs(dc[i]) < 1e-8 ? (dc[i] < 0 ? -1e-8 : 1e-8) : dc[i]);
+    let t1 = (mins[i] - oc[i]) * inv;
+    let t2 = (maxs[i] - oc[i]) * inv;
+    if (t1 > t2) {
+      const s = t1;
+      t1 = t2;
+      t2 = s;
+    }
+    tmin = Math.max(tmin, t1);
+    tmax = Math.min(tmax, t2);
+    if (tmax < tmin) return null;
+  }
+  if (tmax < 0) return null;
+  return tmin > 0 ? tmin : null;
+}
+
+export function rayCapsule(ro: V3, rd: V3, pa: V3, pb: V3, ra: number): number | null {
+  const ba = sub(pb, pa);
+  const oa = sub(ro, pa);
+  const baba = dot(ba, ba);
+  const bard = dot(ba, rd);
+  const baoa = dot(ba, oa);
+  const rdoa = dot(rd, oa);
+  const oaoa = dot(oa, oa);
+  const a = baba - bard * bard;
+  const b = baba * rdoa - baoa * bard;
+  const c = baba * oaoa - baoa * baoa - ra * ra * baba;
+  const h = b * b - a * c;
+  if (h >= 0 && Math.abs(a) > 1e-5) {
+    const t = (-b - Math.sqrt(h)) / a;
+    const y = baoa + t * bard;
+    if (y > 0 && y < baba && t > 0.001) return t;
+  }
+  let best: number | null = null;
+  const tryCap = (center: V3) => {
+    const oc = sub(ro, center);
+    const bb = dot(rd, oc);
+    const cc = dot(oc, oc) - ra * ra;
+    const hh = bb * bb - cc;
+    if (hh < 0) return;
+    const t = -bb - Math.sqrt(hh);
+    if (t > 0.001 && (best === null || t < best)) best = t;
+  };
+  tryCap(pa);
+  tryCap(pb);
+  return best;
+}
+
+function norm(v: V3): V3 {
+  const l = len(v) || 1;
+  return { x: v.x / l, y: v.y / l, z: v.z / l };
+}
+
+function magSize(w: WeaponDef): number {
+  if (w.kind === "melee") return 1;
+  return w.mag;
+}
+
+export class Match {
+  cfg: MatchConfig;
+  map: ArenaMap;
+  boxes: Box[];
+  fighters: Fighter[] = [];
+  projs: Proj[] = [];
+  phase: Phase = "count";
+  phaseT = 3;
+  fightTime = 0;
+  round = 1;
+  scores: [number, number] = [0, 0];
+  winner: 0 | 1 | null = null;
+  gapTeam: 0 | 1 | null = null;
+  time = 0;
+  tick = 0;
+  fx: Fx[] = [];
+  gravity = 26;
+  hpMax = 100;
+  projId = 1;
+  qa: boolean;
+
+  constructor(cfg: MatchConfig, qa = false) {
+    this.cfg = cfg;
+    this.map = mapById(cfg.mapId);
+    this.boxes = solidBoxes(this.map);
+    this.qa = qa;
+    if (cfg.mod === "moon") this.gravity = 11;
+    if (cfg.mod === "glass") this.hpMax = 100;
+    for (const slot of cfg.slots) this.fighters.push(this.makeFighter(slot));
+    this.respawnAll();
+    if (qa) {
+      this.phase = "fight";
+      this.phaseT = 0;
+      for (const f of this.fighters) f.invuln = 0;
+    }
+  }
+
+  private kitFor(slotWeapons: [string, string]): [string, string] {
+    if (this.cfg.mod === "glass") return ["glassline", "glassline"];
+    if (this.cfg.mod === "cutter") return ["blade", "blade"];
+    return slotWeapons;
+  }
+
+  private makeFighter(slot: MatchConfig["slots"][number]): Fighter {
+    const weapons = this.kitFor(slot.weapons);
+    const f: Fighter = {
+      id: slot.id,
+      name: slot.name,
+      team: slot.team,
+      bot: slot.bot,
+      color: slot.color,
+      x: 0,
+      y: 0,
+      z: 0,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      yaw: 0,
+      pitch: 0,
+      grounded: true,
+      crouch: false,
+      ax: 0,
+      az: 0,
+      sprint: false,
+      jump: false,
+      height: 1.72,
+      hp: this.hpMax,
+      alive: true,
+      weapons,
+      slot: 0,
+      mags: [0, 0],
+      reserves: [0, 0],
+      reload: 0,
+      fireCd: 0,
+      burstLeft: 0,
+      heat: 0,
+      kills: 0,
+      ads: false,
+      fire: false,
+      fireSeq: 0,
+      seenFire: 0,
+      reloadSeq: 0,
+      seenReload: 0,
+      swapSeq: 0,
+      seenSwap: 0,
+      meleeSeq: 0,
+      seenMelee: 0,
+      invuln: 0,
+      hitFlash: 0,
+      recoil: 0,
+      think: 0,
+      strafe: Math.random() * 6,
+      meleeCd: 0,
+    };
+    this.refill(f);
+    return f;
+  }
+
+  private refill(f: Fighter) {
+    for (let i = 0; i < 2; i++) {
+      const w = weapon(f.weapons[i]);
+      f.mags[i] = magSize(w);
+      f.reserves[i] = w.kind === "melee" ? 0 : w.reserve;
+    }
+    f.reload = 0;
+    f.fireCd = 0;
+  }
+
+  respawnAll() {
+    const used = [0, 0];
+    for (const f of this.fighters) {
+      const spots = this.map.spawns[f.team];
+      const s = spots[used[f.team] % spots.length];
+      used[f.team]++;
+      f.x = s.x;
+      f.y = 0.02;
+      f.z = s.z;
+      f.vx = f.vy = f.vz = 0;
+      f.hp = this.hpMax;
+      f.alive = true;
+      f.crouch = false;
+      f.invuln = this.qa ? 0 : 1.35;
+      f.yaw = Math.atan2(-(0 - f.x), -(0 - f.z));
+      f.pitch = 0;
+      f.ax = 0;
+      f.az = 0;
+      f.fire = false;
+      this.refill(f);
+      f.grounded = true;
+    }
+  }
+
+  applyInput(id: string, input: InputState) {
+    const f = this.fighters.find((p) => p.id === id);
+    if (!f || f.bot) return;
+    f.yaw = input.yaw;
+    f.pitch = clamp(input.pitch, -1.45, 1.45);
+    f.ax = input.ax;
+    f.az = input.az;
+    f.sprint = input.sprint;
+    f.crouch = input.crouch;
+    f.fire = input.fire;
+    f.fireSeq = input.fireSeq;
+    f.reloadSeq = input.reloadSeq;
+    f.swapSeq = input.swapSeq;
+    f.meleeSeq = input.meleeSeq;
+    f.ads = input.ads;
+    if (input.jump) f.jump = true;
+  }
+
+  step(dt: number): Fx[] {
+    this.fx = [];
+    let acc = dt;
+    let guard = 0;
+    while (acc >= STEP && guard < 5) {
+      this.fixed(STEP);
+      acc -= STEP;
+      guard++;
+    }
+    return this.fx;
+  }
+
+  private fixed(dt: number) {
+    this.tick++;
+    this.time += dt;
+    if (this.phase === "count") {
+      this.phaseT -= dt;
+      if (this.phaseT <= 0) {
+        this.phase = "fight";
+        this.fightTime = 0;
+      }
+    } else if (this.phase === "fight") {
+      this.fightTime += dt;
+    } else if (this.phase === "gap") {
+      this.phaseT -= dt;
+      if (this.phaseT <= 0) {
+        this.round += 1;
+        this.respawnAll();
+        this.phase = "count";
+        this.phaseT = 3;
+      }
+    }
+
+    const fighting = this.phase === "fight";
+    for (const f of this.fighters) {
+      f.hitFlash = Math.max(0, f.hitFlash - dt);
+      f.invuln = Math.max(0, f.invuln - dt);
+      f.fireCd = Math.max(0, f.fireCd - dt);
+      f.meleeCd = Math.max(0, f.meleeCd - dt);
+      const wasReloading = f.reload > 0;
+      f.reload = Math.max(0, f.reload - dt);
+      if (wasReloading && f.reload === 0) this.finishReload(f);
+      f.recoil *= Math.exp(-9 * dt);
+      f.heat = Math.max(0, f.heat - dt * 1.4);
+      if (!f.alive) {
+        f.vx *= 0.9;
+        f.vz *= 0.9;
+        continue;
+      }
+      if (!fighting) {
+        f.ax = 0;
+        f.az = 0;
+        f.fire = false;
+        f.jump = false;
+        f.vx = 0;
+        f.vz = 0;
+        continue;
+      }
+      if (f.bot) this.thinkBot(f, dt);
+      if (f.swapSeq !== f.seenSwap) {
+        f.seenSwap = f.swapSeq;
+        f.slot = f.slot === 0 ? 1 : 0;
+        f.reload = 0;
+        f.burstLeft = 0;
+      }
+      if (f.reloadSeq !== f.seenReload) {
+        f.seenReload = f.reloadSeq;
+        this.startReload(f);
+      }
+      if (f.reload > 0 && f.mags[f.slot] === magSize(weapon(f.weapons[f.slot]))) {
+        /* still reloading into full is fine */
+      }
+      moveBody(f, dt, this.boxes, this.gravity);
+      if (f.meleeSeq !== f.seenMelee) {
+        f.seenMelee = f.meleeSeq;
+        this.quickMelee(f);
+      }
+      this.handleFire(f);
+    }
+    if (fighting) {
+      this.stepProjs(dt);
+      this.checkRound();
+    }
+  }
+
+  private thinkBot(f: Fighter, dt: number) {
+    f.think -= dt;
+    const enemies = this.fighters.filter((o) => o.alive && o.team !== f.team);
+    if (!enemies.length) {
+      f.fire = false;
+      f.ax = 0;
+      f.az = 0;
+      return;
+    }
+    let target = enemies[0];
+    let best = Infinity;
+    for (const e of enemies) {
+      const d = (e.x - f.x) ** 2 + (e.z - f.z) ** 2;
+      if (d < best) {
+        best = d;
+        target = e;
+      }
+    }
+    const dx = target.x - f.x;
+    const dz = target.z - f.z;
+    const dist = Math.hypot(dx, dz) || 0.001;
+    const desiredYaw = Math.atan2(-dx, -dz);
+    const maxTurn = 2.6 * dt;
+    f.yaw += clamp(wrap(desiredYaw - f.yaw), -maxTurn, maxTurn);
+    const eye = f.y + 1.45;
+    const aimY = target.y + 1.15;
+    const desiredPitch = Math.atan2(aimY - eye, dist);
+    f.pitch += clamp(desiredPitch - f.pitch, -maxTurn, maxTurn);
+    f.pitch = clamp(f.pitch, -1.1, 1.1);
+
+    if (f.think <= 0) {
+      f.think = 0.14 + Math.random() * 0.12;
+      f.strafe = Math.sin(this.time * 1.8 + f.strafe);
+      const w = weapon(f.weapons[f.slot]);
+      const prefer = w.kind === "melee" ? 1.6 : w.id === "scatter" ? 7 : w.ads ? 22 : 12;
+      if (dist > prefer + 4) {
+        f.az = 1;
+        f.ax = f.strafe * 0.55;
+        f.sprint = dist > 16;
+      } else if (dist < Math.max(2.2, prefer - 4) && w.kind !== "melee") {
+        f.az = -0.65;
+        f.ax = Math.sign(f.strafe) || 1;
+        f.sprint = false;
+      } else {
+        f.az = 0.15;
+        f.ax = Math.sign(f.strafe) || 1;
+        f.sprint = false;
+      }
+      f.jump = f.grounded && Math.random() < 0.08 && dist > 6 && dist < 18;
+      const los = this.lineClear(f, target);
+      const yawErr = Math.abs(wrap(desiredYaw - f.yaw));
+      const can = los && yawErr < 0.22 && dist < w.range + 4;
+      f.ads = Boolean(w.ads) && dist > 14 && can;
+      if (w.auto) f.fire = can && Math.random() > 0.18;
+      else if (can && f.fireCd <= 0 && f.burstLeft <= 0 && Math.random() > 0.2) f.fireSeq++;
+      else f.fire = false;
+      if (f.mags[f.slot] <= 0 && w.kind !== "melee") {
+        if (f.reserves[f.slot] > 0 && f.reload <= 0) f.reloadSeq++;
+        const other = f.slot === 0 ? 1 : 0;
+        const ow = weapon(f.weapons[other]);
+        if (f.reserves[f.slot] <= 0 && f.slot === 0 && (f.mags[other] > 0 || ow.kind === "melee")) {
+          f.swapSeq++;
+        }
+      }
+      if (dist < 2.3 && w.kind !== "melee" && Math.random() < 0.35) f.meleeSeq++;
+    }
+  }
+
+  private lineClear(a: Fighter, b: Fighter): boolean {
+    const o = { x: a.x, y: a.y + 1.45, z: a.z };
+    const t = { x: b.x, y: b.y + 1.1, z: b.z };
+    const d = norm(sub(t, o));
+    const dist = len(sub(t, o));
+    const wall = this.rayWorld(o, d);
+    return wall === null || wall > dist - 0.3;
+  }
+
+  private rayWorld(o: V3, d: V3): number | null {
+    let best: number | null = null;
+    for (const box of this.boxes) {
+      const t = rayAABB(o, d, box);
+      if (t !== null && t > 0.05 && (best === null || t < best)) best = t;
+    }
+    return best;
+  }
+
+  private startReload(f: Fighter) {
+    const w = weapon(f.weapons[f.slot]);
+    if (w.kind === "melee") return;
+    if (f.reload > 0) return;
+    if (f.mags[f.slot] >= w.mag) return;
+    if (f.reserves[f.slot] <= 0 && w.mag > 0) return;
+    f.reload = w.reload;
+    f.burstLeft = 0;
+  }
+
+  private finishReload(f: Fighter) {
+    const w = weapon(f.weapons[f.slot]);
+    if (w.kind === "melee") return;
+    const need = w.mag - f.mags[f.slot];
+    const take = Math.min(need, f.reserves[f.slot]);
+    f.mags[f.slot] += take;
+    f.reserves[f.slot] -= take;
+  }
+
+  private handleFire(f: Fighter) {
+    if (f.reload > 0) return;
+    const w = weapon(f.weapons[f.slot]);
+    if (w.auto) {
+      if (f.fire && f.fireCd <= 0) this.discharge(f, w);
+      return;
+    }
+    if (w.burst) {
+      if (f.fireSeq !== f.seenFire) {
+        f.seenFire = f.fireSeq;
+        f.burstLeft = w.burst;
+      }
+      if (f.burstLeft > 0 && f.fireCd <= 0) {
+        this.discharge(f, w);
+        f.burstLeft--;
+        if (f.burstLeft <= 0) f.fireCd = Math.max(f.fireCd, 60 / w.rpm);
+      }
+      return;
+    }
+    if (f.fireSeq !== f.seenFire) {
+      f.seenFire = f.fireSeq;
+      this.discharge(f, w);
+    }
+  }
+
+  private discharge(f: Fighter, w: WeaponDef) {
+    if (!f.alive) return;
+    if (w.kind === "melee") {
+      this.melee(f, w.dmg, w.range);
+      f.fireCd = 60 / w.rpm;
+      return;
+    }
+    if (w.kind === "proj") {
+      if (f.mags[f.slot] <= 0) {
+        this.startReload(f);
+        return;
+      }
+      this.spawnProj(f, w);
+      f.mags[f.slot]--;
+      f.fireCd = 60 / w.rpm;
+      f.recoil += w.recoil;
+      if (f.mags[f.slot] <= 0) this.startReload(f);
+      return;
+    }
+    if (f.mags[f.slot] <= 0) {
+      this.startReload(f);
+      return;
+    }
+    const pellets = w.pellets ?? 1;
+    for (let i = 0; i < pellets; i++) this.shootRay(f, w);
+    f.mags[f.slot]--;
+    f.heat = Math.min(1, f.heat + (w.auto ? 0.12 : 0.25));
+    f.recoil += w.recoil * (f.ads ? 0.65 : 1);
+    f.fireCd = w.burst ? 0.06 : 60 / w.rpm;
+    if (f.mags[f.slot] <= 0) this.startReload(f);
+  }
+
+  private shootRay(f: Fighter, w: WeaponDef) {
+    const eyeY = f.y + (f.crouch ? 1.05 : 1.52);
+    const o = { x: f.x, y: eyeY, z: f.z };
+    let dir = forward(f.yaw, f.pitch);
+    const spread = w.spread * (f.ads ? 0.22 : 1) * (0.65 + f.heat) + (f.bot ? 0.035 : 0);
+    if (spread > 0) {
+      dir = norm({
+        x: dir.x + (Math.random() - 0.5) * spread,
+        y: dir.y + (Math.random() - 0.5) * spread,
+        z: dir.z + (Math.random() - 0.5) * spread,
+      });
+    }
+    let maxT = Math.min(w.range, 180);
+    const wall = this.rayWorld(o, dir);
+    if (wall !== null) maxT = Math.min(maxT, wall);
+    let best: { t: number; fighter: Fighter } | null = null;
+    for (const oth of this.fighters) {
+      if (oth === f || !oth.alive || oth.team === f.team || oth.invuln > 0) continue;
+      const h = oth.crouch ? 1.15 : 1.72;
+      const t = rayCapsule(
+        o,
+        dir,
+        { x: oth.x, y: oth.y + 0.38, z: oth.z },
+        { x: oth.x, y: oth.y + h - 0.18, z: oth.z },
+        0.4,
+      );
+      if (t !== null && t < maxT && (best === null || t < best.t)) best = { t, fighter: oth };
+    }
+    const endT = best ? best.t : maxT;
+    const end = { x: o.x + dir.x * endT, y: o.y + dir.y * endT, z: o.z + dir.z * endT };
+    const right = flatRight(f.yaw);
+    this.fx.push({
+      kind: "tracer",
+      owner: f.id,
+      x: o.x + right.x * 0.22,
+      y: o.y - 0.12,
+      z: o.z + right.z * 0.22,
+      x2: end.x,
+      y2: end.y,
+      z2: end.z,
+    });
+    if (!best) return;
+    const hy = end.y;
+    const headCut = best.fighter.y + (best.fighter.crouch ? 0.82 : 1.28);
+    const head = hy > headCut;
+    let dmg = w.dmg * (head ? 1.8 : 1);
+    if (this.cfg.mod === "glass") dmg = 200;
+    const fall = endT > 28 ? clamp(1 - (endT - 28) / 70, 0.45, 1) : 1;
+    this.hurt(best.fighter, f, dmg * fall, head, end);
+  }
+
+  private melee(f: Fighter, dmg: number, range: number) {
+    const dir = flatForward(f.yaw);
+    const o = { x: f.x, y: f.y + 1.2, z: f.z };
+    this.fx.push({
+      kind: "tracer",
+      owner: f.id,
+      x: o.x,
+      y: o.y,
+      z: o.z,
+      x2: o.x + dir.x * range,
+      y2: o.y,
+      z2: o.z + dir.z * range,
+    });
+    let best: Fighter | null = null;
+    let bestD = range;
+    for (const oth of this.fighters) {
+      if (oth === f || !oth.alive || oth.team === f.team || oth.invuln > 0) continue;
+      const dx = oth.x - f.x;
+      const dz = oth.z - f.z;
+      const along = dx * dir.x + dz * dir.z;
+      if (along < 0 || along > range) continue;
+      const lateral = Math.hypot(dx - dir.x * along, dz - dir.z * along);
+      if (lateral < 0.85 && along < bestD) {
+        best = oth;
+        bestD = along;
+      }
+    }
+    if (best) {
+      const end = { x: best.x, y: best.y + 1.1, z: best.z };
+      this.hurt(best, f, dmg, false, end);
+    }
+  }
+
+  private quickMelee(f: Fighter) {
+    if (f.meleeCd > 0) return;
+    const w = weapon(f.weapons[f.slot]);
+    if (w.kind === "melee") return;
+    f.meleeCd = 0.72;
+    this.melee(f, 42, 2.15);
+  }
+
+  private hurt(victim: Fighter, attacker: Fighter, dmg: number, head: boolean, at: V3) {
+    if (!victim.alive || victim.invuln > 0) return;
+    victim.hp -= dmg;
+    victim.hitFlash = 0.14;
+    this.fx.push({
+      kind: "hit",
+      owner: attacker.id,
+      victim: victim.id,
+      ownerName: attacker.name,
+      victimName: victim.name,
+      head,
+      dmg,
+      x: at.x,
+      y: at.y,
+      z: at.z,
+    });
+    const push = 2.2;
+    const dx = victim.x - attacker.x;
+    const dz = victim.z - attacker.z;
+    const l = Math.hypot(dx, dz) || 1;
+    victim.vx += (dx / l) * push;
+    victim.vz += (dz / l) * push;
+    if (victim.hp <= 0) {
+      victim.hp = 0;
+      victim.alive = false;
+      attacker.kills++;
+      this.fx.push({
+        kind: "kill",
+        owner: attacker.id,
+        victim: victim.id,
+        ownerName: attacker.name,
+        victimName: victim.name,
+        x: victim.x,
+        y: victim.y + 1,
+        z: victim.z,
+      });
+    }
+  }
+
+  private spawnProj(f: Fighter, w: WeaponDef) {
+    const dir = forward(f.yaw, f.pitch);
+    const speed = w.speed ?? 18;
+    const o = {
+      x: f.x + dir.x * 0.9,
+      y: f.y + (f.crouch ? 1.05 : 1.45) + dir.y * 0.4,
+      z: f.z + dir.z * 0.9,
+    };
+    this.projs.push({
+      id: this.projId++,
+      owner: f.id,
+      team: f.team,
+      kind: w.proj ?? "grenade",
+      x: o.x,
+      y: o.y,
+      z: o.z,
+      vx: dir.x * speed + f.vx * 0.3,
+      vy: dir.y * speed + (w.proj === "grenade" ? 3.5 : 0),
+      vz: dir.z * speed + f.vz * 0.3,
+      life: w.fuse ?? 3.2,
+      dmg: this.cfg.mod === "glass" ? 200 : w.dmg,
+      radius: w.radius ?? 3,
+      armed: 0.12,
+    });
+  }
+
+  private stepProjs(dt: number) {
+    const next: Proj[] = [];
+    for (const p of this.projs) {
+      p.life -= dt;
+      p.armed = Math.max(0, p.armed - dt);
+      const g = p.kind === "grenade" ? this.gravity : this.gravity * 0.12;
+      p.vy -= g * dt;
+      let nx = p.x + p.vx * dt;
+      let ny = p.y + p.vy * dt;
+      let nz = p.z + p.vz * dt;
+      let boom = p.life <= 0;
+      const hitBox = this.pointBox(nx, ny, nz);
+      if (hitBox) {
+        if (p.kind === "rocket") boom = true;
+        else {
+          const cx = (hitBox.minX + hitBox.maxX) / 2;
+          const cy = (hitBox.minY + hitBox.maxY) / 2;
+          const cz = (hitBox.minZ + hitBox.maxZ) / 2;
+          const dx = p.x - cx;
+          const dy = p.y - cy;
+          const dz = p.z - cz;
+          const ax = Math.abs(dx) / ((hitBox.maxX - hitBox.minX) / 2 || 1);
+          const ay = Math.abs(dy) / ((hitBox.maxY - hitBox.minY) / 2 || 1);
+          const az = Math.abs(dz) / ((hitBox.maxZ - hitBox.minZ) / 2 || 1);
+          if (ay >= ax && ay >= az) p.vy *= -0.45;
+          else if (ax >= az) p.vx *= -0.45;
+          else p.vz *= -0.45;
+          nx = p.x;
+          ny = p.y;
+          nz = p.z;
+          p.life -= 0.02;
+        }
+      }
+      if (!boom && p.armed <= 0) {
+        for (const f of this.fighters) {
+          if (!f.alive || f.team === p.team) continue;
+          const h = f.crouch ? 1.15 : 1.72;
+          const cy = f.y + h * 0.5;
+          if (Math.hypot(nx - f.x, ny - cy, nz - f.z) < 0.7) boom = true;
+        }
+      }
+      if (ny < 0.08 && p.kind === "grenade") {
+        ny = 0.08;
+        p.vy = Math.abs(p.vy) * 0.4;
+        p.vx *= 0.8;
+        p.vz *= 0.8;
+      }
+      if (boom || ny < -2 || ny > 40) {
+        this.explode(p);
+        continue;
+      }
+      p.x = nx;
+      p.y = ny;
+      p.z = nz;
+      next.push(p);
+    }
+    this.projs = next;
+  }
+
+  private pointBox(x: number, y: number, z: number): Box | null {
+    for (const b of this.boxes) {
+      if (x > b.minX && x < b.maxX && y > b.minY && y < b.maxY && z > b.minZ && z < b.maxZ) {
+        if (b.maxY <= 0.02) continue;
+        return b;
+      }
+    }
+    return null;
+  }
+
+  private explode(p: Proj) {
+    this.fx.push({ kind: "boom", owner: p.owner, x: p.x, y: p.y, z: p.z });
+    const attacker = this.fighters.find((f) => f.id === p.owner);
+    for (const f of this.fighters) {
+      if (!f.alive || f.team === p.team || f.invuln > 0) continue;
+      const h = f.height || 1.72;
+      const cy = f.y + h * 0.45;
+      const d = Math.hypot(f.x - p.x, cy - p.y, f.z - p.z);
+      if (d > p.radius) continue;
+      const fall = 1 - d / p.radius;
+      if (attacker) this.hurt(f, attacker, p.dmg * fall, false, { x: f.x, y: cy, z: f.z });
+    }
+  }
+
+  private checkRound() {
+    if (this.phase !== "fight") return;
+    const a = this.fighters.some((f) => f.team === 0 && f.alive);
+    const b = this.fighters.some((f) => f.team === 1 && f.alive);
+    if (a && b) return;
+    if (a && !b) {
+      this.scores[0]++;
+      this.gapTeam = 0;
+    } else if (b && !a) {
+      this.scores[1]++;
+      this.gapTeam = 1;
+    } else {
+      this.gapTeam = null;
+    }
+    if (this.scores[0] >= 5 || this.scores[1] >= 5) {
+      this.phase = "end";
+      this.winner = this.scores[0] >= this.scores[1] ? 0 : 1;
+      this.phaseT = 0;
+      return;
+    }
+    this.phase = "gap";
+    this.phaseT = 2.4;
+  }
+
+  snapshot(): NetSnap {
+    return {
+      k: "snap",
+      tick: this.tick,
+      phase: this.phase,
+      phaseT: this.phaseT,
+      fightTime: this.fightTime,
+      round: this.round,
+      scores: [this.scores[0], this.scores[1]],
+      winner: this.winner,
+      gapTeam: this.gapTeam,
+      mapId: this.map.id,
+      fx: this.fx.slice(0, 24),
+      projs: this.projs.map((p) => ({
+        x: round3(p.x),
+        y: round3(p.y),
+        z: round3(p.z),
+        kind: p.kind,
+        team: p.team,
+      })),
+      fighters: this.fighters.map((f) => ({
+        id: f.id,
+        name: f.name,
+        team: f.team,
+        bot: f.bot,
+        color: f.color,
+        x: round3(f.x),
+        y: round3(f.y),
+        z: round3(f.z),
+        yaw: round3(f.yaw),
+        pitch: round3(f.pitch),
+        vx: round3(f.vx),
+        vz: round3(f.vz),
+        hp: Math.round(f.hp),
+        alive: f.alive,
+        slot: f.slot,
+        mag: f.mags[f.slot],
+        reserve: f.reserves[f.slot],
+        weapons: f.weapons,
+        kills: f.kills,
+        crouch: f.crouch,
+        ads: f.ads,
+        invuln: round3(f.invuln),
+        hitFlash: round3(f.hitFlash),
+        heat: round3(f.heat),
+        reload: round3(f.reload),
+      })),
+    };
+  }
+
+  self(id: string): Fighter | undefined {
+    return this.fighters.find((f) => f.id === id);
+  }
+}
+
+function round3(n: number): number {
+  return Math.round(n * 1000) / 1000;
+}
+
+export function bodyFromSnap(s: SnapFighter): Body {
+  return {
+    x: s.x,
+    y: s.y,
+    z: s.z,
+    vx: s.vx,
+    vy: 0,
+    vz: s.vz,
+    yaw: s.yaw,
+    pitch: s.pitch,
+    grounded: s.y <= 0.05,
+    crouch: s.crouch,
+    ax: 0,
+    az: 0,
+    sprint: false,
+    jump: false,
+    height: s.crouch ? 1.15 : 1.72,
+  };
+}
